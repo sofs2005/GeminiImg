@@ -22,7 +22,7 @@ from plugins import *
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
     version="1.0.0",
-    author="XYBot (Adapted by Cursor)",
+    author="sofs2005",
 )
 class GeminiImage(Plugin):
     """基于Google Gemini的图像生成插件
@@ -128,19 +128,25 @@ class GeminiImage(Plugin):
         
         context = e_context['context']
         
-        # 只处理文本消息
-        if context.type != ContextType.TEXT:
-            return
-        
-        content = context.content.strip()
-        
-        # 清理过期的会话
+        # 清理过期的会话和图片缓存
         self._cleanup_expired_conversations()
+        self._cleanup_image_cache()
         
         # 会话标识: 用户ID+会话ID
         user_id = context["session_id"]
         conversation_key = user_id
         is_group = context.get("isgroup", False)
+        
+        # 处理图片消息 - 用于缓存用户发送的图片
+        if context.type == ContextType.IMAGE:
+            self._handle_image_message(e_context)
+            return
+            
+        # 处理文本消息
+        if context.type != ContextType.TEXT:
+            return
+        
+        content = context.content.strip()
         
         # 检查是否是结束对话命令
         if content in self.exit_commands:
@@ -280,10 +286,109 @@ class GeminiImage(Plugin):
                     e_context.action = EventAction.BREAK_PASS
                     return
                 
-                # 检查是否有上一次生成的图片
+                # 先尝试从缓存获取最近的图片
+                image_data = self._get_recent_image(conversation_key)
+                if image_data:
+                    # 如果找到缓存的图片，保存到本地再处理
+                    image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                    with open(image_path, "wb") as f:
+                        f.write(image_data)
+                    self.last_images[conversation_key] = image_path
+                    logger.info(f"找到最近缓存的图片，保存到：{image_path}")
+                    
+                    # 尝试编辑图片
+                    try:
+                        # 发送处理中消息
+                        processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
+                        e_context["reply"] = processing_reply
+                        
+                        # 获取会话上下文
+                        conversation_history = self.conversations[conversation_key]
+                        
+                        # 编辑图片
+                        result_image, text_response = self._edit_image(prompt, image_data, conversation_history)
+                        
+                        if result_image:
+                            # 保存编辑后的图片
+                            reply_text = text_response if text_response else "图片编辑成功！"
+                            if not conversation_history or len(conversation_history) <= 2:  # 如果是新会话
+                                reply_text += f"（已开始图像对话，可以继续发送命令修改图片。需要结束时请发送\"{self.exit_commands[0]}\"）"
+                            
+                            # 将回复文本添加到文件名中
+                            clean_text = reply_text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_")
+                            clean_text = clean_text[:30] + "..." if len(clean_text) > 30 else clean_text
+                            
+                            edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}_{clean_text}.png")
+                            with open(edited_image_path, "wb") as f:
+                                f.write(result_image)
+                            
+                            # 更新最后生成的图片路径
+                            self.last_images[conversation_key] = edited_image_path
+                            
+                            # 更新会话历史
+                            user_message = {
+                                "role": "user", 
+                                "parts": [
+                                    {"text": prompt},
+                                    {"image_url": image_path}
+                                ]
+                            }
+                            conversation_history.append(user_message)
+                            
+                            assistant_message = {
+                                "role": "model", 
+                                "parts": [
+                                    {"text": text_response if text_response else "我已编辑完成图片"},
+                                    {"image_url": edited_image_path}
+                                ]
+                            }
+                            conversation_history.append(assistant_message)
+                            
+                            # 限制会话历史长度
+                            if len(conversation_history) > 10:  # 保留最近5轮对话
+                                conversation_history = conversation_history[-10:]
+                            
+                            # 更新会话时间戳
+                            self.conversation_timestamps[conversation_key] = time.time()
+                            
+                            # 准备回复文本
+                            reply_text = text_response if text_response else "图片编辑成功！"
+                            if not conversation_history or len(conversation_history) <= 2:  # 如果是新会话
+                                reply_text += f"（已开始图像对话，可以继续发送命令修改图片。需要结束时请发送\"{self.exit_commands[0]}\"）"
+                            
+                            # 先发送文本消息
+                            e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
+                            
+                            # 创建文件对象，由框架负责关闭
+                            edited_image_file = open(edited_image_path, "rb")
+                            e_context["reply"] = Reply(ReplyType.IMAGE, edited_image_file)
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+                        else:
+                            # 检查是否有文本响应，可能是内容被拒绝
+                            if text_response:
+                                # 内容审核拒绝的情况，翻译并发送拒绝消息
+                                translated_response = self._translate_gemini_message(text_response)
+                                reply = Reply(ReplyType.TEXT, translated_response)
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                            else:
+                                reply = Reply(ReplyType.TEXT, "图片编辑失败，请稍后再试或修改描述")
+                                e_context["reply"] = reply
+                                e_context.action = EventAction.BREAK_PASS
+                            return
+                    except Exception as e:
+                        logger.error(f"编辑图片失败: {str(e)}")
+                        logger.exception(e)
+                        reply = Reply(ReplyType.TEXT, f"编辑图片失败: {str(e)}")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                
+                # 检查是否有上一次上传/生成的图片
                 last_image_path = self.last_images.get(conversation_key)
                 if not last_image_path or not os.path.exists(last_image_path):
-                    reply = Reply(ReplyType.TEXT, "未找到可编辑的图片，请先使用生成图片命令")
+                    reply = Reply(ReplyType.TEXT, "未找到可编辑的图片，请先上传一张图片或使用生成图片命令")
                     e_context["reply"] = reply
                     e_context.action = EventAction.BREAK_PASS
                     return
@@ -476,6 +581,244 @@ class GeminiImage(Plugin):
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
             return
+    
+    def _handle_image_message(self, e_context: EventContext):
+        """处理图片消息，缓存图片数据以备后续编辑使用"""
+        context = e_context['context']
+        session_id = context["session_id"]
+        is_group = context.get("isgroup", False)
+        
+        # 获取发送者ID，确保群聊和单聊场景都能正确缓存
+        sender_id = None
+        if 'msg' in context.kwargs:
+            msg = context.kwargs['msg']
+            # 优先使用actual_user_id或from_user_id
+            if hasattr(msg, 'actual_user_id') and msg.actual_user_id:
+                sender_id = msg.actual_user_id
+                logger.info(f"使用actual_user_id作为发送者ID: {sender_id}")
+            elif hasattr(msg, 'from_user_id') and msg.from_user_id:
+                sender_id = msg.from_user_id
+                logger.info(f"使用from_user_id作为发送者ID: {sender_id}")
+            # 检查是否在群聊中sender_id与session_id相同，如果相同说明获取发送者ID不正确
+            if is_group and sender_id == session_id:
+                # 尝试从其他属性获取发送者ID
+                if hasattr(msg, 'sender_id') and msg.sender_id:
+                    sender_id = msg.sender_id
+                    logger.info(f"使用sender_id作为发送者ID: {sender_id}")
+                elif hasattr(msg, 'sender_wxid') and msg.sender_wxid:
+                    sender_id = msg.sender_wxid
+                    logger.info(f"使用sender_wxid作为发送者ID: {sender_id}")
+                elif hasattr(msg, 'self_display_name') and msg.self_display_name:
+                    # 作为最后的备选方案，使用显示名称
+                    sender_id = msg.self_display_name
+                    logger.info(f"使用self_display_name作为发送者ID: {sender_id}")
+        
+        # 记录所有可能的用户标识符，便于调试
+        if 'msg' in context.kwargs and hasattr(context.kwargs['msg'], '__dict__'):
+            user_attrs = {}
+            for attr in ['from_user_id', 'actual_user_id', 'sender_id', 'sender_wxid', 'from_user_nickname', 
+                         'self_display_name', 'other_user_id']:
+                if hasattr(context.kwargs['msg'], attr):
+                    user_attrs[attr] = getattr(context.kwargs['msg'], attr)
+            logger.info(f"消息对象中的用户标识符: {user_attrs}")
+        
+        # 如果仍然无法获取sender_id，使用session_id的一部分
+        if not sender_id:
+            sender_id = f"user_{hash(session_id) % 10000}"
+            logger.info(f"使用生成的ID作为发送者ID: {sender_id}")
+        
+        # 生成缓存键，在群聊中使用群ID+用户ID组合，在单聊中使用用户ID
+        if is_group:
+            # 群聊场景：群ID_用户ID
+            cache_key = f"{session_id}_{sender_id}"
+        else:
+            # 单聊场景：使用发送者ID
+            cache_key = sender_id
+        
+        logger.info(f"图片缓存键: {cache_key} (群聊:{is_group})")
+        
+        try:
+            # 获取图片数据
+            image_data = None
+            
+            # 尝试从content获取文件路径并读取文件
+            if hasattr(context, 'content') and context.content:
+                file_path = context.content
+                # 尝试将相对路径转换为绝对路径
+                if not os.path.isabs(file_path):
+                    abs_path = os.path.abspath(file_path)
+                    logger.info(f"转换为绝对路径: {abs_path}")
+                    if os.path.exists(abs_path):
+                        file_path = abs_path
+                
+                logger.info(f"从content获取到文件路径: {file_path}")
+                if os.path.exists(file_path):
+                    try:
+                        with open(file_path, 'rb') as f:
+                            image_data = f.read()
+                        logger.info(f"从文件路径读取到图片数据，大小: {len(image_data)} 字节")
+                    except Exception as e:
+                        logger.error(f"读取图片文件失败: {e}")
+                else:
+                    logger.warning(f"文件路径不存在: {file_path}")
+            
+            # 尝试从msg对象获取图片数据
+            if not image_data and 'msg' in context.kwargs:
+                msg = context.kwargs['msg']
+                logger.info(f"MSG对象属性: {dir(msg)}")
+                
+                # 检查msg是否有download_image方法
+                if hasattr(msg, 'download_image') and callable(getattr(msg, 'download_image')):
+                    try:
+                        image_data = msg.download_image()
+                        logger.info(f"通过download_image方法获取到图片数据")
+                    except Exception as e:
+                        logger.error(f"download_image方法调用失败: {e}")
+                
+                # 检查msg是否有msg_data属性
+                elif hasattr(msg, 'msg_data'):
+                    try:
+                        msg_data = msg.msg_data
+                        logger.info(f"MSG.msg_data: {type(msg_data)}")
+                        if isinstance(msg_data, dict) and 'image' in msg_data:
+                            image_data = msg_data['image']
+                            logger.info(f"从msg_data['image']获取到图片数据")
+                        elif isinstance(msg_data, bytes):
+                            image_data = msg_data
+                            logger.info(f"从msg_data(bytes)获取到图片数据")
+                    except Exception as e:
+                        logger.error(f"获取msg_data失败: {e}")
+                
+                # 检查msg是否有img属性
+                elif hasattr(msg, 'img') and msg.img:
+                    image_data = msg.img
+                    logger.info(f"从msg.img获取到图片数据")
+                
+                # 检查msg是否有文件内容属性
+                elif hasattr(msg, 'content') and isinstance(msg.content, bytes):
+                    image_data = msg.content
+                    logger.info(f"从msg.content获取到图片数据，大小: {len(image_data)} 字节")
+                
+                # 检查msg对象中可能保存的地址
+                if hasattr(msg, 'from_user_id') and hasattr(msg, 'msg_id'):
+                    # 尝试构建通用图片保存路径
+                    possible_paths = [
+                        f"tmp/{msg.msg_id}.png",
+                        f"tmp/{msg.msg_id}.jpg",
+                        f"tmp/image_{msg.msg_id}.png",
+                        f"tmp/image_{msg.from_user_id}_{msg.msg_id}.png"
+                    ]
+                    
+                    for path in possible_paths:
+                        if os.path.exists(path):
+                            try:
+                                with open(path, 'rb') as f:
+                                    image_data = f.read()
+                                logger.info(f"从路径 {path} 读取到图片数据，大小: {len(image_data)} 字节")
+                                break
+                            except Exception as e:
+                                logger.error(f"读取图片 {path} 失败: {e}")
+            
+            # 验证获取到的图片数据是否有效
+            if image_data and len(image_data) > 100:
+                # 尝试验证图片格式
+                try:
+                    Image.open(BytesIO(image_data))
+                    
+                    # 保存图片到缓存
+                    self.image_cache[cache_key] = {
+                        "content": image_data,
+                        "timestamp": time.time()
+                    }
+                    logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {cache_key}")
+                    
+                    # 静默处理图片，不发送任何提示消息
+                except Exception as e:
+                    logger.error(f"验证图片格式失败: {e}")
+            else:
+                logger.warning(f"未获取到有效的图片数据或数据太小: {image_data[:20] if image_data else 'None'}")
+        except Exception as e:
+            logger.error(f"处理图片消息失败: {str(e)}")
+            logger.exception(e)
+    
+    def _get_recent_image(self, conversation_key: str) -> Optional[bytes]:
+        """获取最近的图片数据，支持群聊和单聊场景
+        
+        Args:
+            conversation_key: 会话标识，可能是session_id或用户ID
+            
+        Returns:
+            Optional[bytes]: 图片数据或None
+        """
+        # 尝试从conversation_key直接获取缓存
+        cache_data = self.image_cache.get(conversation_key)
+        if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
+            logger.info(f"从缓存获取到图片数据，大小: {len(cache_data['content'])} 字节，缓存键: {conversation_key}")
+            return cache_data["content"]
+        
+        # 群聊场景：尝试使用当前消息上下文中的发送者ID
+        context = e_context['context'] if 'e_context' in locals() else None
+        if not context and hasattr(self, 'current_context'):
+            context = self.current_context
+            
+        if context and context.get("isgroup", False):
+            sender_id = None
+            if 'msg' in context.kwargs:
+                msg = context.kwargs['msg']
+                # 优先使用actual_user_id或from_user_id
+                if hasattr(msg, 'actual_user_id') and msg.actual_user_id:
+                    sender_id = msg.actual_user_id
+                elif hasattr(msg, 'from_user_id') and msg.from_user_id:
+                    sender_id = msg.from_user_id
+                # 如果sender_id与session_id相同，尝试其他属性
+                if sender_id == context.get("session_id"):
+                    if hasattr(msg, 'sender_id') and msg.sender_id:
+                        sender_id = msg.sender_id
+                    elif hasattr(msg, 'sender_wxid') and msg.sender_wxid:
+                        sender_id = msg.sender_wxid
+                    elif hasattr(msg, 'self_display_name') and msg.self_display_name:
+                        sender_id = msg.self_display_name
+                
+                if sender_id:
+                    # 使用群ID_用户ID格式查找
+                    group_key = f"{context.get('session_id')}_{sender_id}"
+                    cache_data = self.image_cache.get(group_key)
+                    if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
+                        logger.info(f"从群聊缓存键获取到图片数据，大小: {len(cache_data['content'])} 字节，缓存键: {group_key}")
+                        return cache_data["content"]
+        
+        # 遍历所有缓存键，查找匹配的键
+        for cache_key in self.image_cache:
+            if cache_key.startswith(f"{conversation_key}_") or cache_key.endswith(f"_{conversation_key}"):
+                cache_data = self.image_cache.get(cache_key)
+                if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
+                    logger.info(f"从组合缓存键获取到图片数据，大小: {len(cache_data['content'])} 字节，缓存键: {cache_key}")
+                    return cache_data["content"]
+                
+        # 如果没有找到，尝试其他方法
+        if '_' in conversation_key:
+            # 拆分组合键，可能是群ID_用户ID格式
+            parts = conversation_key.split('_')
+            for part in parts:
+                cache_data = self.image_cache.get(part)
+                if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
+                    logger.info(f"从拆分键部分获取到图片数据，大小: {len(cache_data['content'])} 字节，缓存键: {part}")
+                    return cache_data["content"]
+                    
+        return None
+    
+    def _cleanup_image_cache(self):
+        """清理过期的图片缓存"""
+        current_time = time.time()
+        expired_keys = []
+        
+        for key, cache_data in self.image_cache.items():
+            if current_time - cache_data["timestamp"] > self.image_cache_timeout:
+                expired_keys.append(key)
+        
+        for key in expired_keys:
+            del self.image_cache[key]
+            logger.debug(f"清理过期图片缓存: {key}")
     
     def _cleanup_expired_conversations(self):
         """清理过期的会话"""
@@ -752,9 +1095,14 @@ class GeminiImage(Plugin):
                 # 记录完整响应内容，方便调试
                 logger.debug(f"Gemini API响应内容: {result}")
                 
-                # 提取响应
+                # 检查是否有内容安全问题
                 candidates = result.get("candidates", [])
                 if candidates and len(candidates) > 0:
+                    finish_reason = candidates[0].get("finishReason", "")
+                    if finish_reason == "IMAGE_SAFETY":
+                        logger.warning("Gemini API返回IMAGE_SAFETY，图片内容可能违反安全政策")
+                        return None, json.dumps(result)  # 返回整个响应作为错误信息
+                    
                     content = candidates[0].get("content", {})
                     parts = content.get("parts", [])
                     
@@ -791,6 +1139,14 @@ class GeminiImage(Plugin):
     
     def _translate_gemini_message(self, text: str) -> str:
         """将Gemini API的英文消息翻译成中文"""
+        # 内容安全过滤消息
+        if "finishReason" in text and "IMAGE_SAFETY" in text:
+            return "抱歉，您的请求可能违反了内容安全政策，无法生成或编辑图片。请尝试修改您的描述，提供更为安全、合规的内容。"
+        
+        # 处理API响应中的特定错误
+        if "finishReason" in text:
+            return "抱歉，图片处理失败，请尝试其他描述或稍后再试。"
+            
         # 常见的内容审核拒绝消息翻译
         if "I'm unable to create this image" in text:
             if "sexually suggestive" in text:
