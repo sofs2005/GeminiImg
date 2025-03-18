@@ -22,7 +22,7 @@ from plugins import *
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
     version="1.0.0",
-    author="sofs2005",
+    author="Lingyuzhou",
 )
 class GeminiImage(Plugin):
     """基于Google Gemini的图像生成插件
@@ -39,9 +39,9 @@ class GeminiImage(Plugin):
         "enable": True,
         "gemini_api_key": "",
         "model": "gemini-2.0-flash-exp-image-generation",
-        "commands": ["#生成图片", "#画图", "#图片生成"],
-        "edit_commands": ["#编辑图片", "#修改图片"],
-        "exit_commands": ["#结束对话", "#退出对话", "#关闭对话", "#结束"],
+        "commands": ["$生成图片", "$画图", "$图片生成"],
+        "edit_commands": ["$编辑图片", "$修改图片"],
+        "exit_commands": ["$结束对话", "$退出对话", "$关闭对话", "$结束"],
         "enable_points": False,
         "generate_image_cost": 10,
         "edit_image_cost": 15,
@@ -49,6 +49,8 @@ class GeminiImage(Plugin):
         "admins": [],
         "enable_proxy": False,
         "proxy_url": "",
+        "use_proxy_service": True,
+        "proxy_service_url": ""
     }
 
     def __init__(self):
@@ -57,9 +59,7 @@ class GeminiImage(Plugin):
             super().__init__()
             
             # 载入配置
-            self.config = super().load_config()
-            if not self.config:
-                self.config = self._load_config_template()
+            self.config = super().load_config() or self._load_config_template()
             
             # 使用默认配置初始化
             for key, default_value in self.DEFAULT_CONFIG.items():
@@ -69,6 +69,8 @@ class GeminiImage(Plugin):
             # 设置配置参数
             self.enable = self.config.get("enable", True)
             self.api_key = self.config.get("gemini_api_key", "")
+            
+            # 模型配置
             self.model = self.config.get("model", "gemini-2.0-flash-exp-image-generation")
             
             # 获取命令配置
@@ -92,6 +94,10 @@ class GeminiImage(Plugin):
             # 获取代理配置
             self.enable_proxy = self.config.get("enable_proxy", False)
             self.proxy_url = self.config.get("proxy_url", "")
+            
+            # 获取代理服务配置
+            self.use_proxy_service = self.config.get("use_proxy_service", True)
+            self.proxy_service_url = self.config.get("proxy_service_url", "")
             
             # 初始化会话状态，用于保存上下文
             self.conversations = defaultdict(list)  # 用户ID -> 对话历史列表
@@ -376,7 +382,6 @@ class GeminiImage(Plugin):
                                 reply = Reply(ReplyType.TEXT, "图片编辑失败，请稍后再试或修改描述")
                                 e_context["reply"] = reply
                                 e_context.action = EventAction.BREAK_PASS
-                            return
                     except Exception as e:
                         logger.error(f"编辑图片失败: {str(e)}")
                         logger.exception(e)
@@ -385,6 +390,8 @@ class GeminiImage(Plugin):
                         e_context.action = EventAction.BREAK_PASS
                         return
                 
+
+
                 # 检查是否有上一次上传/生成的图片
                 last_image_path = self.last_images.get(conversation_key)
                 if not last_image_path or not os.path.exists(last_image_path):
@@ -599,147 +606,60 @@ class GeminiImage(Plugin):
             elif hasattr(msg, 'from_user_id') and msg.from_user_id:
                 sender_id = msg.from_user_id
                 logger.info(f"使用from_user_id作为发送者ID: {sender_id}")
-            # 检查是否在群聊中sender_id与session_id相同，如果相同说明获取发送者ID不正确
-            if is_group and sender_id == session_id:
-                # 尝试从其他属性获取发送者ID
-                if hasattr(msg, 'sender_id') and msg.sender_id:
-                    sender_id = msg.sender_id
-                    logger.info(f"使用sender_id作为发送者ID: {sender_id}")
-                elif hasattr(msg, 'sender_wxid') and msg.sender_wxid:
-                    sender_id = msg.sender_wxid
-                    logger.info(f"使用sender_wxid作为发送者ID: {sender_id}")
-                elif hasattr(msg, 'self_display_name') and msg.self_display_name:
-                    # 作为最后的备选方案，使用显示名称
-                    sender_id = msg.self_display_name
-                    logger.info(f"使用self_display_name作为发送者ID: {sender_id}")
-        
-        # 记录所有可能的用户标识符，便于调试
-        if 'msg' in context.kwargs and hasattr(context.kwargs['msg'], '__dict__'):
-            user_attrs = {}
-            for attr in ['from_user_id', 'actual_user_id', 'sender_id', 'sender_wxid', 'from_user_nickname', 
-                         'self_display_name', 'other_user_id']:
-                if hasattr(context.kwargs['msg'], attr):
-                    user_attrs[attr] = getattr(context.kwargs['msg'], attr)
-            logger.info(f"消息对象中的用户标识符: {user_attrs}")
-        
-        # 如果仍然无法获取sender_id，使用session_id的一部分
-        if not sender_id:
-            sender_id = f"user_{hash(session_id) % 10000}"
-            logger.info(f"使用生成的ID作为发送者ID: {sender_id}")
-        
-        # 生成缓存键，在群聊中使用群ID+用户ID组合，在单聊中使用用户ID
-        if is_group:
-            # 群聊场景：群ID_用户ID
-            cache_key = f"{session_id}_{sender_id}"
-        else:
-            # 单聊场景：使用发送者ID
-            cache_key = sender_id
-        
-        logger.info(f"图片缓存键: {cache_key} (群聊:{is_group})")
-        
-        try:
+            
             # 获取图片数据
             image_data = None
             
-            # 尝试从content获取文件路径并读取文件
-            if hasattr(context, 'content') and context.content:
-                file_path = context.content
-                # 尝试将相对路径转换为绝对路径
-                if not os.path.isabs(file_path):
-                    abs_path = os.path.abspath(file_path)
-                    logger.info(f"转换为绝对路径: {abs_path}")
-                    if os.path.exists(abs_path):
-                        file_path = abs_path
-                
-                logger.info(f"从content获取到文件路径: {file_path}")
-                if os.path.exists(file_path):
-                    try:
-                        with open(file_path, 'rb') as f:
-                            image_data = f.read()
-                        logger.info(f"从文件路径读取到图片数据，大小: {len(image_data)} 字节")
-                    except Exception as e:
-                        logger.error(f"读取图片文件失败: {e}")
-                else:
-                    logger.warning(f"文件路径不存在: {file_path}")
-            
-            # 尝试从msg对象获取图片数据
-            if not image_data and 'msg' in context.kwargs:
-                msg = context.kwargs['msg']
-                logger.info(f"MSG对象属性: {dir(msg)}")
-                
-                # 检查msg是否有download_image方法
-                if hasattr(msg, 'download_image') and callable(getattr(msg, 'download_image')):
-                    try:
-                        image_data = msg.download_image()
-                        logger.info(f"通过download_image方法获取到图片数据")
-                    except Exception as e:
-                        logger.error(f"download_image方法调用失败: {e}")
-                
-                # 检查msg是否有msg_data属性
-                elif hasattr(msg, 'msg_data'):
-                    try:
-                        msg_data = msg.msg_data
-                        logger.info(f"MSG.msg_data: {type(msg_data)}")
-                        if isinstance(msg_data, dict) and 'image' in msg_data:
-                            image_data = msg_data['image']
-                            logger.info(f"从msg_data['image']获取到图片数据")
-                        elif isinstance(msg_data, bytes):
-                            image_data = msg_data
-                            logger.info(f"从msg_data(bytes)获取到图片数据")
-                    except Exception as e:
-                        logger.error(f"获取msg_data失败: {e}")
-                
-                # 检查msg是否有img属性
-                elif hasattr(msg, 'img') and msg.img:
-                    image_data = msg.img
-                    logger.info(f"从msg.img获取到图片数据")
-                
-                # 检查msg是否有文件内容属性
-                elif hasattr(msg, 'content') and isinstance(msg.content, bytes):
-                    image_data = msg.content
-                    logger.info(f"从msg.content获取到图片数据，大小: {len(image_data)} 字节")
-                
-                # 检查msg对象中可能保存的地址
-                if hasattr(msg, 'from_user_id') and hasattr(msg, 'msg_id'):
-                    # 尝试构建通用图片保存路径
-                    possible_paths = [
-                        f"tmp/{msg.msg_id}.png",
-                        f"tmp/{msg.msg_id}.jpg",
-                        f"tmp/image_{msg.msg_id}.png",
-                        f"tmp/image_{msg.from_user_id}_{msg.msg_id}.png"
-                    ]
-                    
-                    for path in possible_paths:
-                        if os.path.exists(path):
-                            try:
-                                with open(path, 'rb') as f:
-                                    image_data = f.read()
-                                logger.info(f"从路径 {path} 读取到图片数据，大小: {len(image_data)} 字节")
-                                break
-                            except Exception as e:
-                                logger.error(f"读取图片 {path} 失败: {e}")
-            
-            # 验证获取到的图片数据是否有效
-            if image_data and len(image_data) > 100:
-                # 尝试验证图片格式
+            # 检查msg是否有download_image方法
+            if hasattr(msg, 'download_image') and callable(getattr(msg, 'download_image')):
                 try:
+                    image_data = msg.download_image()
+                    logger.info(f"通过download_image方法获取到图片数据")
+                except Exception as e:
+                    logger.error(f"download_image方法调用失败: {e}")
+            
+            # 检查msg是否有msg_data属性
+            elif hasattr(msg, 'msg_data'):
+                try:
+                    msg_data = msg.msg_data
+                    logger.info(f"MSG.msg_data: {type(msg_data)}")
+                    if isinstance(msg_data, dict) and 'image' in msg_data:
+                        image_data = msg_data['image']
+                        logger.info(f"从msg_data['image']获取到图片数据")
+                    elif isinstance(msg_data, bytes):
+                        image_data = msg_data
+                        logger.info(f"从msg_data(bytes)获取到图片数据")
+                except Exception as e:
+                    logger.error(f"获取msg_data失败: {e}")
+            
+            # 检查msg是否有img属性
+            elif hasattr(msg, 'img') and msg.img:
+                image_data = msg.img
+                logger.info(f"从msg.img获取到图片数据")
+            
+            # 检查msg是否有文件内容属性
+            elif hasattr(msg, 'content') and isinstance(msg.content, bytes):
+                image_data = msg.content
+                logger.info(f"从msg.content获取到图片数据，大小: {len(image_data)} 字节")
+            
+            # 如果获取到图片数据，进行处理
+            if image_data and len(image_data) > 1000:  # 确保数据大小合理
+                try:
+                    # 验证是否为有效的图片数据
                     Image.open(BytesIO(image_data))
                     
                     # 保存图片到缓存
-                    self.image_cache[cache_key] = {
+                    self.image_cache[session_id] = {
                         "content": image_data,
                         "timestamp": time.time()
                     }
-                    logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {cache_key}")
+                    logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {session_id}")
                     
                     # 静默处理图片，不发送任何提示消息
                 except Exception as e:
-                    logger.error(f"验证图片格式失败: {e}")
+                    logger.error(f"验证图片数据失败: {str(e)}")
             else:
                 logger.warning(f"未获取到有效的图片数据或数据太小: {image_data[:20] if image_data else 'None'}")
-        except Exception as e:
-            logger.error(f"处理图片消息失败: {str(e)}")
-            logger.exception(e)
     
     def _get_recent_image(self, conversation_key: str) -> Optional[bytes]:
         """获取最近的图片数据，支持群聊和单聊场景
@@ -839,14 +759,24 @@ class GeminiImage(Plugin):
     
     def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API生成图片，返回图片数据和文本响应"""
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
-        headers = {
-            "Content-Type": "application/json",
-        }
-        
-        params = {
-            "key": self.api_key
-        }
+        # 根据配置决定使用直接调用还是通过代理服务调用
+        if self.use_proxy_service and self.proxy_service_url:
+            # 使用代理服务调用API
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
+            }
+            params = {}  # 不需要在URL参数中传递API密钥
+        else:
+            # 直接调用Google API
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            params = {
+                "key": self.api_key
+            }
         
         # 构建请求数据
         if conversation_history and len(conversation_history) > 0:
@@ -914,7 +844,8 @@ class GeminiImage(Plugin):
         
         # 创建代理配置
         proxies = None
-        if self.enable_proxy and self.proxy_url:
+        if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+            # 只有在直接调用Google API且启用了代理时才使用代理
             proxies = {
                 "http": self.proxy_url,
                 "https": self.proxy_url
@@ -935,10 +866,26 @@ class GeminiImage(Plugin):
             logger.info(f"Gemini API响应状态码: {response.status_code}")
             
             if response.status_code == 200:
-                result = response.json()
+                # 先记录响应内容，便于调试
+                response_text = response.text
+                logger.debug(f"Gemini API原始响应内容长度: {len(response_text)}, 前100个字符: {response_text[:100] if response_text else '空'}")
                 
-                # 记录完整响应内容，方便调试
-                logger.debug(f"Gemini API响应内容: {result}")
+                # 检查响应内容是否为空
+                if not response_text.strip():
+                    logger.error("Gemini API返回了空响应")
+                    return None, "API返回了空响应，请检查网络连接或代理服务配置"
+                
+                try:
+                    result = response.json()
+                    # 记录解析后的JSON结构
+                    logger.debug(f"Gemini API响应JSON结构: {result}")
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"JSON解析错误: {str(json_err)}, 响应内容: {response_text[:200]}")
+                    # 检查是否是代理服务问题
+                    if self.use_proxy_service:
+                        logger.error("可能是代理服务配置问题，尝试禁用代理服务或检查代理服务实现")
+                        return None, "API响应格式错误，可能是代理服务配置问题。请检查代理服务实现或暂时禁用代理服务。"
+                    return None, f"API响应格式错误: {str(json_err)}"
                 
                 # 提取响应
                 candidates = result.get("candidates", [])
@@ -969,24 +916,46 @@ class GeminiImage(Plugin):
                 
                 logger.error(f"未找到生成的图片数据: {result}")
                 return None, None
+            elif response.status_code == 400:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查请求参数或网络连接"
+            elif response.status_code == 401:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查API密钥或代理服务配置"
+            elif response.status_code == 403:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查API密钥或代理服务配置"
+            elif response.status_code == 429:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请稍后再试或检查代理服务配置"
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, None
+                return None, "API调用失败，请检查网络连接或代理服务配置"
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
-            return None, None
+            return None, f"API调用异常: {str(e)}"
     
     def _edit_image(self, prompt: str, image_data: bytes, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API编辑图片，返回图片数据和文本响应"""
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
-        headers = {
-            "Content-Type": "application/json",
-        }
-        
-        params = {
-            "key": self.api_key
-        }
+        # 根据配置决定使用直接调用还是通过代理服务调用
+        if self.use_proxy_service and self.proxy_service_url:
+            # 使用代理服务调用API
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
+            }
+            params = {}  # 不需要在URL参数中传递API密钥
+        else:
+            # 直接调用Google API
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            params = {
+                "key": self.api_key
+            }
         
         # 将图片数据转换为Base64编码
         image_base64 = base64.b64encode(image_data).decode("utf-8")
@@ -1069,7 +1038,8 @@ class GeminiImage(Plugin):
         
         # 创建代理配置
         proxies = None
-        if self.enable_proxy and self.proxy_url:
+        if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+            # 只有在直接调用Google API且启用了代理时才使用代理
             proxies = {
                 "http": self.proxy_url,
                 "https": self.proxy_url
@@ -1090,10 +1060,26 @@ class GeminiImage(Plugin):
             logger.info(f"Gemini API响应状态码: {response.status_code}")
             
             if response.status_code == 200:
-                result = response.json()
+                # 先记录响应内容，便于调试
+                response_text = response.text
+                logger.debug(f"Gemini API原始响应内容长度: {len(response_text)}, 前100个字符: {response_text[:100] if response_text else '空'}")
                 
-                # 记录完整响应内容，方便调试
-                logger.debug(f"Gemini API响应内容: {result}")
+                # 检查响应内容是否为空
+                if not response_text.strip():
+                    logger.error("Gemini API返回了空响应")
+                    return None, "API返回了空响应，请检查网络连接或代理服务配置"
+                
+                try:
+                    result = response.json()
+                    # 记录解析后的JSON结构
+                    logger.debug(f"Gemini API响应JSON结构: {result}")
+                except json.JSONDecodeError as json_err:
+                    logger.error(f"JSON解析错误: {str(json_err)}, 响应内容: {response_text[:200]}")
+                    # 检查是否是代理服务问题
+                    if self.use_proxy_service:
+                        logger.error("可能是代理服务配置问题，尝试禁用代理服务或检查代理服务实现")
+                        return None, "API响应格式错误，可能是代理服务配置问题。请检查代理服务实现或暂时禁用代理服务。"
+                    return None, f"API响应格式错误: {str(json_err)}"
                 
                 # 检查是否有内容安全问题
                 candidates = result.get("candidates", [])
@@ -1129,13 +1115,25 @@ class GeminiImage(Plugin):
                 
                 logger.error(f"未找到编辑后的图片数据: {result}")
                 return None, None
+            elif response.status_code == 400:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查请求参数或网络连接"
+            elif response.status_code == 401:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查API密钥或代理服务配置"
+            elif response.status_code == 403:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请检查API密钥或代理服务配置"
+            elif response.status_code == 429:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None, "API调用失败，请稍后再试或检查代理服务配置"
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, None
+                return None, "API调用失败，请检查网络连接或代理服务配置"
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
-            return None, None
+            return None, f"API调用异常: {str(e)}"
     
     def _translate_gemini_message(self, text: str) -> str:
         """将Gemini API的英文消息翻译成中文"""
@@ -1178,19 +1176,43 @@ class GeminiImage(Plugin):
                     return plugin_conf
         except Exception as e:
             logger.exception(e)
-            return self.DEFAULT_CONFIG
+            return {
+                "enable": True,
+                "gemini_api_key": "",
+                "model": "gemini-2.0-flash-exp-image-generation",
+                "commands": ["#生成图片", "#画图", "#图片生成"],
+                "edit_commands": ["#编辑图片", "#修改图片"],
+                "exit_commands": ["#结束对话", "#退出对话", "#关闭对话", "#结束"],
+                "enable_points": False,
+                "generate_image_cost": 10,
+                "edit_image_cost": 15,
+                "save_path": "temp",
+                "admins": [],
+                "enable_proxy": False,
+                "proxy_url": "",
+                "use_proxy_service": True,
+                "proxy_service_url": ""
+            }
     
     def get_help_text(self, verbose=False, **kwargs):
         help_text = "基于Google Gemini的图像生成插件\n"
-        help_text += "支持以下命令：\n"
-        help_text += f"1. 生成图片：{' 或 '.join(self.commands)} [描述]\n"
-        help_text += f"2. 编辑图片：{' 或 '.join(self.edit_commands)} [描述]\n"
-        help_text += f"3. 结束对话：{' 或 '.join(self.exit_commands)}\n\n"
+        help_text += "可以生成和编辑图片，支持连续对话\n\n"
+        help_text += "使用方法：\n"
+        help_text += f"1. 生成图片：发送 {self.commands[0]} + 描述，例如：{self.commands[0]} 一只可爱的猫咪\n"
+        help_text += f"2. 编辑图片：发送 {self.edit_commands[0]} + 描述 + 图片，例如：{self.edit_commands[0]} 把猫咪变成蓝色\n"
+        help_text += f"3. 结束会话：发送 {self.exit_commands[0]}\n\n"
         
         if verbose:
-            help_text += "使用说明：\n"
-            help_text += "- 生成图片后会开始一个会话，可以通过发送命令继续修改图片\n"
-            help_text += "- 每个会话的有效期为10分钟，超时需要重新开始\n"
-            help_text += "- 发送结束对话命令可以立即结束当前会话\n"
+            help_text += "当前配置：\n"
+            help_text += f"当前模型：{self.model}\n"
+            help_text += f"生成图片命令：{', '.join(self.commands)}\n"
+            help_text += f"编辑图片命令：{', '.join(self.edit_commands)}\n"
+            help_text += f"结束会话命令：{', '.join(self.exit_commands)}\n"
+            
+            if self.enable_proxy:
+                help_text += "已启用HTTP代理\n"
+            
+            if self.use_proxy_service:
+                help_text += "已启用代理服务\n"
         
-        return help_text 
+        return help_text
