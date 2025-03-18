@@ -9,7 +9,9 @@
   "generate_image_cost": 10,
   "edit_image_cost": 15,
   "save_path": "temp",
-  "admins": [],
+  "admins": ["your_nickname"],
   "enable_proxy": false,
-  "proxy_url": ""
-} 
+  "proxy_url": "",
+  "use_proxy_service": true,
+  "proxy_service_url": "your_deno_proxy_service_url"
+}
