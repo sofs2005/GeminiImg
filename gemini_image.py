@@ -1209,10 +1209,10 @@ class GeminiImage(Plugin):
             help_text += f"编辑图片命令：{', '.join(self.edit_commands)}\n"
             help_text += f"结束会话命令：{', '.join(self.exit_commands)}\n"
             
-            if self.enable_proxy:
-                help_text += "已启用HTTP代理\n"
+#           if self.enable_proxy:
+#               help_text += "已启用HTTP代理\n"
             
-            if self.use_proxy_service:
-                help_text += "已启用代理服务\n"
+#           if self.use_proxy_service:
+#               help_text += "已启用代理服务\n"
         
         return help_text
