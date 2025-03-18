@@ -2,7 +2,9 @@
 
 基于Google Gemini的图像生成插件，使用Gemini 2.0 FlashExp模型生成和编辑图片。
 
-> 本插件改编自XYbot的插件 [GeminiImage](https://github.com/NanSsye/GeminiImage)，感谢原作者的贡献。
+> 本插件fork自sofs2005的插件 [GeminiImage](https://github.com/sofs2005/GeminiImg)，感谢原作者的贡献。
+
+> 在原来的版本上增加支持Deno代理服务，解决网络限制问题。具体教程详见另外的文档 https://github.com/Lingyuzhou111/gemini
 
 ## 功能特点
 
@@ -10,6 +12,7 @@
 - 编辑已有图片，调整风格和内容
 - 支持会话模式，可以连续对话修改图片
 - 支持代理设置，方便国内用户使用
+- 支持Deno代理服务，解决网络限制问题
 
 ## 安装方法
 
@@ -36,8 +39,10 @@
   "edit_image_cost": 15,                          # 编辑图片消耗的积分
   "save_path": "temp",                            # 图片保存路径
   "admins": [],                                   # 管理员列表，这些用户不受积分限制
-  "enable_proxy": false,                          # 是否启用代理
-  "proxy_url": ""                                 # 代理服务器URL
+  "enable_proxy": false,                          # 是否启用HTTP代理
+  "proxy_url": "",                                # HTTP代理服务器URL
+  "use_proxy_service": true,                      # 是否启用Deno代理服务
+  "proxy_service_url": ""                         # Deno代理服务URL
 }
 ```
 
@@ -69,6 +74,15 @@ $编辑图片 将柴犬换成一只猫，保持相同的场景
 $结束对话
 ```
 
+## 网络配置
+
+插件提供了两种网络配置方式，帮助解决网络限制问题：
+
+1. **HTTP代理**：通过设置 `enable_proxy` 和 `proxy_url` 来使用HTTP代理访问Google API
+2. **Deno代理服务**：通过设置 `use_proxy_service` 和 `proxy_service_url` 来使用Deno代理服务访问Google API
+
+对于无法直接访问Google服务的用户，建议启用Deno代理服务。
+
 ## 注意事项
 
 1. 需要申请Google Gemini API密钥，可以在[Google AI Studio](https://aistudio.google.com/)申请
@@ -76,17 +90,9 @@ $结束对话
 3. 图片生成和编辑可能需要一些时间，请耐心等待
 4. 每个会话的有效期为10分钟，超时后需要重新开始
 5. 不支持生成违反内容政策的图片，如色情、暴力等内容
+6. 如需更改使用的模型，请直接修改配置文件中的 `model` 值
 
 ## 版本历史
 
 - v1.0.0: 初始版本，支持基本的图片生成和编辑功能
-
-## Star History
-
-[![Star History Chart](https://api.star-history.com/svg?repos=sofs2005/GeminiImg&type=Date)](https://star-history.com/#sofs2005/GeminiImg&Date)
-
-## 打赏支持
-
-如果您觉得这个插件对您有帮助，欢迎扫描下方二维码进行打赏支持，让我能够持续改进和开发更多实用功能。
-
-![微信打赏码](https://github.com/sofs2005/difytask/raw/main/img/wx.png?raw=true)
+- v1.1.0: 添加Deno代理服务支持，优化配置管理
