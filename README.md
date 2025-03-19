@@ -36,11 +36,11 @@
 {
   "enable": true,                                 # 是否启用插件
   "gemini_api_key": "your_api_key_here",          # Google Gemini API密钥
-  "model": "gemini-2.0-flash-exp-image-generation", # 使用的模型名称
-  "commands": ["$生成图片", "$画图", "$图片生成"],    # 生成图片的命令
-  "edit_commands": ["$编辑图片", "$修改图片"],       # 编辑图片的命令
-  "reference_edit_commands": ["$参考图", "$编辑参考图"], # 参考图编辑的命令
-  "exit_commands": ["$结束对话", "$退出对话", "$关闭对话", "$结束"], # 结束对话的命令
+  "model": "gemini-2.0-flash-exp-image-generation",     # 使用的模型名称
+  "commands": ["g生成图片", "g画图", "g画一个"],         # 生成图片的命令
+  "edit_commands": ["g编辑图片", "g改图"],               # 编辑图片的命令
+  "reference_edit_commands": ["g参考图", "g编辑参考图"], # 参考图编辑的命令
+  "exit_commands": ["g结束对话", "g结束"],               # 结束对话的命令
   "enable_points": false,                         # 是否启用积分系统
   "generate_image_cost": 10,                      # 生成图片消耗的积分
   "edit_image_cost": 15,                          # 编辑图片消耗的积分
