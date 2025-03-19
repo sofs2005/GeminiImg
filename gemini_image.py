@@ -21,7 +21,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
-    version="1.0.3",
+    version="1.1.0",
     author="sofs2005",
 )
 class GeminiImage(Plugin):

@@ -13,10 +13,10 @@
 
 ## 安装方法
 
-1. 确保你已经安装了chatgpt-on-wechat项目
+1. 确保你已经安装了dify-on-wechat项目
 2. 使用管理员插件安装：
    ```
-   #installp GeminiImage
+   #installp GeminiImage.git
    ```
 3. 安装完成后使用 `#scanp` 命令扫描加载插件
 4. 配置插件：将 `plugins/GeminiImg/config.json.template` 复制为 `plugins/GeminiImg/config.json` 并编辑
@@ -85,6 +85,7 @@ $结束对话
 ## 版本历史
 
 - v1.0.0: 初始版本，支持基本的图片生成和编辑功能
+- v1.1.0: 添加临时文件自动清理功能，支持自定义API基础URL，优化图片缓存机制
 
 ## Star History
 
