@@ -1,16 +1,20 @@
-import os
-import json
-import uuid
-import time
 import base64
-from io import BytesIO
-from typing import Dict, Any, Optional, List, Tuple
+import json
+import logging
+import os
+import time
+import uuid
 from collections import defaultdict
+from io import BytesIO
+from typing import Dict, List, Optional, Tuple, Union, Any
 
 from PIL import Image
-import requests
-from loguru import logger
+from google import genai  # 正确的导入方式
+from google.genai import types
 
+logger = logging.getLogger(__name__)
+
+# Plugin imports
 import plugins
 from bridge.context import ContextType
 from bridge.reply import Reply, ReplyType
@@ -103,6 +107,23 @@ class GeminiImage(Plugin):
             # 验证关键配置
             if not self.api_key:
                 logger.warning("GeminiImage插件未配置API密钥")
+            
+            # 初始化Google Gemini客户端
+            if self.api_key:
+                try:
+                    # 配置环境变量代理
+                    if self.enable_proxy and self.proxy_url:
+                        if self.proxy_url.startswith("http"):
+                            os.environ["HTTPS_PROXY"] = self.proxy_url
+                            os.environ["HTTP_PROXY"] = self.proxy_url
+                        logger.info(f"已设置Gemini客户端代理: {self.proxy_url}")
+                    
+                    # 使用最新的Google API客户端初始化
+                    # 注意：每次生成和编辑图像时会使用 genai.Client(api_key=self.api_key) 创建客户端实例
+                    logger.info(f"Gemini客户端配置准备就绪，将使用模型: {self.model}")
+                except Exception as e:
+                    logger.error(f"Gemini客户端初始化失败: {str(e)}")
+                    logger.exception(e)
             
             # 绑定事件处理函数
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
@@ -938,303 +959,253 @@ class GeminiImage(Plugin):
     
     def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API生成图片，返回图片数据和文本响应"""
-        url = f"{self.base_url}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
-        headers = {
-            "Content-Type": "application/json",
-        }
-        
-        params = {
-            "key": self.api_key
-        }
-        
-        # 构建请求数据
-        if conversation_history and len(conversation_history) > 0:
-            # 有会话历史，构建上下文
-            # 需要处理会话历史中的图片格式
-            processed_history = []
-            for msg in conversation_history:
-                # 转换角色名称，确保使用 "user" 或 "model"
-                role = msg["role"]
-                if role == "assistant":
-                    role = "model"
-                
-                processed_msg = {"role": role, "parts": []}
-                for part in msg["parts"]:
-                    if "text" in part:
-                        processed_msg["parts"].append({"text": part["text"]})
-                    elif "image_url" in part:
-                        # 需要读取图片并转换为inlineData格式
-                        try:
-                            with open(part["image_url"], "rb") as f:
-                                image_data = f.read()
-                                image_base64 = base64.b64encode(image_data).decode("utf-8")
-                                processed_msg["parts"].append({
-                                    "inlineData": {
-                                        "mimeType": "image/png",
-                                        "data": image_base64
-                                    }
-                                })
-                        except Exception as e:
-                            logger.error(f"处理历史图片失败: {e}")
-                            # 跳过这个图片
-                processed_history.append(processed_msg)
-            
-            data = {
-                "contents": processed_history + [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ],
-                "generation_config": {
-                    "response_modalities": ["Text", "Image"]
-                }
-            }
-        else:
-            # 无会话历史，直接使用提示
-            data = {
-                "contents": [
-                    {
-                        "parts": [
-                            {
-                                "text": prompt
-                            }
-                        ]
-                    }
-                ],
-                "generation_config": {
-                    "response_modalities": ["Text", "Image"]
-                }
-            }
-        
-        # 创建代理配置
-        proxies = None
-        if self.enable_proxy and self.proxy_url:
-            proxies = {
-                "http": self.proxy_url,
-                "https": self.proxy_url
-            }
-        
         try:
-            # 发送请求
-            logger.info(f"开始调用Gemini API生成图片")
-            response = requests.post(
-                url, 
-                headers=headers, 
-                params=params, 
-                json=data,
-                proxies=proxies,
-                timeout=60  # 增加超时时间到60秒
+            logger.info(f"开始调用Gemini客户端生成图片")
+            
+            # 初始化客户端，处理自定义API端点
+            if self.base_url != "https://generativelanguage.googleapis.com":
+                client = genai.Client(
+                    api_key=self.api_key,
+                    transport="rest", 
+                    client_options={"api_endpoint": self.base_url}
+                )
+                logger.info(f"使用自定义API端点: {self.base_url}")
+            else:
+                client = genai.Client(api_key=self.api_key)
+            
+            # 直接使用提示文本，不需要复杂的会话处理
+            # 记录会话历史(仅日志)
+            if conversation_history and len(conversation_history) > 0:
+                logger.info(f"会话历史长度: {len(conversation_history)}，但在此实现中不使用历史")
+            
+            # 调用API生成内容
+            response = client.models.generate_content(
+                model=self.model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    response_modalities=['Text', 'Image']
+                )
             )
             
-            logger.info(f"Gemini API响应状态码: {response.status_code}")
+            # 从响应中提取文本和图像
+            text_response = None
+            image_bytes = None
             
-            if response.status_code == 200:
-                result = response.json()
-                
-                # 记录完整响应内容，方便调试
-                logger.debug(f"Gemini API响应内容: {result}")
-                
-                # 提取响应
-                candidates = result.get("candidates", [])
-                if candidates and len(candidates) > 0:
-                    content = candidates[0].get("content", {})
-                    parts = content.get("parts", [])
-                    
-                    # 处理文本和图片响应
-                    text_response = None
-                    image_data = None
-                    
-                    for part in parts:
-                        # 处理文本部分
-                        if "text" in part and part["text"]:
-                            text_response = part["text"]
-                        
-                        # 处理图片部分
-                        if "inlineData" in part:
-                            inline_data = part.get("inlineData", {})
-                            if inline_data and "data" in inline_data:
-                                # 返回Base64解码后的图片数据
-                                image_data = base64.b64decode(inline_data["data"])
-                    
-                    if not image_data:
-                        logger.error(f"API响应中没有找到图片数据: {result}")
-                    
-                    return image_data, text_response
-                
-                logger.error(f"未找到生成的图片数据: {result}")
-                return None, None
-            else:
-                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, None
+            # 处理响应，寻找文本和图像
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, 'text') and part.text:
+                    text_response = part.text
+                    logger.info(f"收到文本响应: {text_response[:100]}...")
+                elif hasattr(part, 'inline_data') and part.inline_data:
+                    logger.info("收到图像响应")
+                    image_bytes = base64.b64decode(part.inline_data.data)
+            
+            if not image_bytes:
+                logger.error("响应中没有图像数据")
+                return None, text_response if text_response else "未能生成图像"
+            
+            logger.info(f"图像生成成功，文本响应长度: {len(text_response) if text_response else 0}")
+            return image_bytes, text_response
+            
         except Exception as e:
-            logger.error(f"API调用异常: {str(e)}")
+            logger.error(f"图像生成失败: {str(e)}")
             logger.exception(e)
-            return None, None
+            return None, f"生成图片时发生错误: {str(e)}"
     
     def _edit_image(self, prompt: str, image_data: bytes, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API编辑图片，返回图片数据和文本响应"""
-        url = f"{self.base_url}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
-        headers = {
-            "Content-Type": "application/json",
-        }
-        
-        params = {
-            "key": self.api_key
-        }
-        
-        # 将图片数据转换为Base64编码
-        image_base64 = base64.b64encode(image_data).decode("utf-8")
-        
-        # 构建请求数据
-        if conversation_history and len(conversation_history) > 0:
-            # 有会话历史，构建上下文
-            # 需要处理会话历史中的图片格式
-            processed_history = []
-            for msg in conversation_history:
-                # 转换角色名称，确保使用 "user" 或 "model"
-                role = msg["role"]
-                if role == "assistant":
-                    role = "model"
-                
-                processed_msg = {"role": role, "parts": []}
-                for part in msg["parts"]:
-                    if "text" in part:
-                        processed_msg["parts"].append({"text": part["text"]})
-                    elif "image_url" in part:
-                        # 需要读取图片并转换为inlineData格式
-                        try:
-                            with open(part["image_url"], "rb") as f:
-                                img_data = f.read()
-                                img_base64 = base64.b64encode(img_data).decode("utf-8")
-                                processed_msg["parts"].append({
-                                    "inlineData": {
-                                        "mimeType": "image/png",
-                                        "data": img_base64
-                                    }
-                                })
-                        except Exception as e:
-                            logger.error(f"处理历史图片失败: {e}")
-                            # 跳过这个图片
-                processed_history.append(processed_msg)
-
-            data = {
-                "contents": processed_history + [
-                    {
-                        "role": "user",
-                        "parts": [
-                            {
-                                "text": prompt
-                            },
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/png",
-                                    "data": image_base64
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "generation_config": {
-                    "response_modalities": ["Text", "Image"]
-                }
-            }
-        else:
-            # 无会话历史，直接使用提示和图片
-            data = {
-                "contents": [
-                    {
-                        "parts": [
-                            {
-                                "text": prompt
-                            },
-                            {
-                                "inlineData": {
-                                    "mimeType": "image/png",
-                                    "data": image_base64
-                                }
-                            }
-                        ]
-                    }
-                ],
-                "generation_config": {
-                    "response_modalities": ["Text", "Image"]
-                }
-            }
-        
-        # 创建代理配置
-        proxies = None
-        if self.enable_proxy and self.proxy_url:
-            proxies = {
-                "http": self.proxy_url,
-                "https": self.proxy_url
-            }
-        
         try:
-            # 发送请求
-            logger.info(f"开始调用Gemini API编辑图片")
-            response = requests.post(
-                url, 
-                headers=headers, 
-                params=params, 
-                json=data,
-                proxies=proxies,
-                timeout=60  # 增加超时时间到60秒
-            )
+            logger.info(f"开始调用Gemini客户端编辑图片")
             
-            logger.info(f"Gemini API响应状态码: {response.status_code}")
-            
-            if response.status_code == 200:
-                result = response.json()
-                
-                # 记录完整响应内容，方便调试
-                logger.debug(f"Gemini API响应内容: {result}")
-                
-                # 检查是否有内容安全问题
-                candidates = result.get("candidates", [])
-                if candidates and len(candidates) > 0:
-                    finish_reason = candidates[0].get("finishReason", "")
-                    if finish_reason == "IMAGE_SAFETY":
-                        logger.warning("Gemini API返回IMAGE_SAFETY，图片内容可能违反安全政策")
-                        return None, json.dumps(result)  # 返回整个响应作为错误信息
-                    
-                    content = candidates[0].get("content", {})
-                    parts = content.get("parts", [])
-                    
-                    # 处理文本和图片响应
-                    text_response = None
-                    image_data = None
-                    
-                    for part in parts:
-                        # 处理文本部分
-                        if "text" in part and part["text"]:
-                            text_response = part["text"]
-                        
-                        # 处理图片部分
-                        if "inlineData" in part:
-                            inline_data = part.get("inlineData", {})
-                            if inline_data and "data" in inline_data:
-                                # 返回Base64解码后的图片数据
-                                image_data = base64.b64decode(inline_data["data"])
-                    
-                    if not image_data:
-                        logger.error(f"API响应中没有找到图片数据: {result}")
-                    
-                    return image_data, text_response
-                
-                logger.error(f"未找到编辑后的图片数据: {result}")
-                return None, None
+            # 初始化客户端，处理自定义API端点
+            if self.base_url != "https://generativelanguage.googleapis.com":
+                client = genai.Client(
+                    api_key=self.api_key,
+                    transport="rest", 
+                    client_options={"api_endpoint": self.base_url}
+                )
+                logger.info(f"使用自定义API端点: {self.base_url}")
             else:
-                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, None
+                client = genai.Client(api_key=self.api_key)
+            
+            # 创建PIL图像对象
+            try:
+                from io import BytesIO
+                img = Image.open(BytesIO(image_data))
+                
+                # 确保图像是RGB格式（移除alpha通道）
+                if img.mode == 'RGBA':
+                    # 使用白色背景替换透明背景
+                    background = Image.new("RGB", img.size, (255, 255, 255))
+                    background.paste(img, mask=img.split()[3])  # 使用alpha通道作为mask
+                    img = background
+                elif img.mode != "RGB":
+                    img = img.convert("RGB")
+                
+                # 确保图像尺寸不超过API限制
+                max_size = 4096  # 根据API限制调整
+                if img.width > max_size or img.height > max_size:
+                    # 保持宽高比
+                    ratio = min(max_size / img.width, max_size / img.height)
+                    new_width = int(img.width * ratio)
+                    new_height = int(img.height * ratio)
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                
+                # 确保图像不会太小
+                min_size = 64
+                if img.width < min_size or img.height < min_size:
+                    # 扩大到最小尺寸
+                    ratio = max(min_size / img.width, min_size / img.height)
+                    new_width = int(img.width * ratio)
+                    new_height = int(img.height * ratio)
+                    img = img.resize((new_width, new_height), Image.LANCZOS)
+                
+                # 保存为PNG格式
+                buffer = BytesIO()
+                img.save(buffer, format="PNG")
+                image_data = buffer.getvalue()
+                
+                # 记录处理后的图像大小
+                img_size_kb = len(image_data) / 1024
+                logger.info(f"处理后的图像大小: {img_size_kb:.2f}KB, 尺寸: {img.width}x{img.height}")
+                
+                # 如果图像太大，可能需要压缩
+                if img_size_kb > 20000:  # 20MB限制
+                    quality = 85
+                    while img_size_kb > 20000 and quality > 40:
+                        buffer = BytesIO()
+                        img.save(buffer, format="JPEG", quality=quality)
+                        image_data = buffer.getvalue()
+                        img_size_kb = len(image_data) / 1024
+                        quality -= 10
+                        logger.info(f"压缩图像, 质量: {quality}, 大小: {img_size_kb:.2f}KB")
+                
+            except Exception as e:
+                logger.error(f"图像处理失败: {e}")
+                return None, f"图像处理失败: {e}"
+            
+            # 构建文本请求和图像内容
+            text_input = f"Hi, here is an image. {prompt}"
+            
+            # 以最简单的方式构建请求
+            try:
+                # 将PIL图像直接用于请求（与文档中的示例类似）
+                pil_img = Image.open(BytesIO(image_data))
+                
+                # 记录会话历史(仅日志)
+                if conversation_history and len(conversation_history) > 0:
+                    logger.info(f"会话历史长度: {len(conversation_history)}，但在此实现中不使用历史")
+                
+                # 调用API生成内容
+                logger.info("正在调用API编辑图像...")
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=[text_input, pil_img],
+                    config=types.GenerateContentConfig(
+                        response_modalities=['Text', 'Image']
+                    )
+                )
+                
+                # 从响应中提取文本和图像
+                text_response = None
+                image_bytes = None
+                
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, 'text') and part.text:
+                        text_response = part.text
+                        logger.info(f"收到文本响应: {text_response[:100]}...")
+                    elif hasattr(part, 'inline_data') and part.inline_data:
+                        logger.info("收到图像响应")
+                        image_bytes = base64.b64decode(part.inline_data.data)
+                
+                if not image_bytes:
+                    logger.error("响应中没有图像数据")
+                    return None, text_response if text_response else "未能生成修改后的图像"
+                
+                logger.info(f"图像编辑成功，文本响应长度: {len(text_response) if text_response else 0}")
+                return image_bytes, text_response
+                
+            except Exception as e:
+                logger.error(f"API调用失败: {e}")
+                logger.exception(e)
+                
+                # 尝试使用更基本的方法作为备选
+                try:
+                    logger.info("尝试使用备选方法发送图像...")
+                    # 将图像编码为base64
+                    encoded_image = base64.b64encode(image_data).decode("utf-8")
+                    
+                    # 准备内容对象
+                    contents = [
+                        text_input,
+                        {
+                            "inline_data": {
+                                "mime_type": "image/png",
+                                "data": encoded_image
+                            }
+                        }
+                    ]
+                    
+                    response = client.models.generate_content(
+                        model=self.model,
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            response_modalities=['Text', 'Image']
+                        )
+                    )
+                    
+                    # 从响应中提取文本和图像
+                    text_response = None
+                    image_bytes = None
+                    
+                    for part in response.candidates[0].content.parts:
+                        if hasattr(part, 'text') and part.text:
+                            text_response = part.text
+                            logger.info(f"备选方法：收到文本响应: {text_response[:100]}...")
+                        elif hasattr(part, 'inline_data') and part.inline_data:
+                            logger.info("备选方法：收到图像响应")
+                            image_bytes = base64.b64decode(part.inline_data.data)
+                    
+                    if not image_bytes:
+                        logger.error("备选方法：响应中没有图像数据")
+                        return None, text_response if text_response else "未能生成修改后的图像"
+                    
+                    logger.info(f"备选方法：图像编辑成功")
+                    return image_bytes, text_response
+                    
+                except Exception as backup_e:
+                    logger.error(f"备选方法也失败: {backup_e}")
+                    logger.exception(backup_e)
+                    return None, f"编辑图片时发生错误: {e}，备选方法也失败: {backup_e}"
+            
         except Exception as e:
-            logger.error(f"API调用异常: {str(e)}")
+            logger.error(f"图像编辑失败: {str(e)}")
             logger.exception(e)
-            return None, None
+            return None, f"编辑图片时发生错误: {str(e)}"
+    
+    def _describe_image(self, image_data: bytes) -> str:
+        """简单描述图像内容，用于生成提示"""
+        try:
+            # 打开图像
+            from io import BytesIO
+            img = Image.open(BytesIO(image_data))
+            
+            # 提取基本图像特征
+            width, height = img.size
+            mode = img.mode
+            aspect_ratio = width / height
+            
+            # 构建简单描述
+            if aspect_ratio > 1.1:
+                orientation = "横向"
+            elif aspect_ratio < 0.9:
+                orientation = "纵向"
+            else:
+                orientation = "方形"
+                
+            return f"{orientation}图像"
+        except:
+            return "图像"
     
     def _translate_gemini_message(self, text: str) -> str:
         """将Gemini API的英文消息翻译成中文"""
