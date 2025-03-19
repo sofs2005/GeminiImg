@@ -21,7 +21,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
-    version="1.0.0",
+    version="1.0.3",
     author="sofs2005",
 )
 class GeminiImage(Plugin):
@@ -39,16 +39,16 @@ class GeminiImage(Plugin):
         "enable": True,
         "gemini_api_key": "",
         "model": "gemini-2.0-flash-exp-image-generation",
-        "commands": ["#生成图片", "#画图", "#图片生成"],
-        "edit_commands": ["#编辑图片", "#修改图片"],
-        "exit_commands": ["#结束对话", "#退出对话", "#关闭对话", "#结束"],
+        "commands": ["$生成图片", "$画图", "$图片生成"],
+        "edit_commands": ["$编辑图片", "$修改图片"],
+        "exit_commands": ["$结束对话", "$退出对话", "$关闭对话", "$结束"],
         "enable_points": False,
         "generate_image_cost": 10,
         "edit_image_cost": 15,
         "save_path": "temp",
-        "admins": [],
         "enable_proxy": False,
         "proxy_url": "",
+        "base_url": "https://generativelanguage.googleapis.com",
     }
 
     def __init__(self):
@@ -76,22 +76,17 @@ class GeminiImage(Plugin):
             self.edit_commands = self.config.get("edit_commands", ["#编辑图片", "#修改图片"])
             self.exit_commands = self.config.get("exit_commands", ["#结束对话", "#退出对话", "#关闭对话", "#结束"])
             
-            # 获取积分配置
-            self.enable_points = self.config.get("enable_points", False)
-            self.generate_cost = self.config.get("generate_image_cost", 10)
-            self.edit_cost = self.config.get("edit_image_cost", 15)
-            
             # 获取图片保存配置
             self.save_path = self.config.get("save_path", "temp")
             self.save_dir = os.path.join(os.path.dirname(__file__), self.save_path)
             os.makedirs(self.save_dir, exist_ok=True)
             
-            # 获取管理员列表
-            self.admins = self.config.get("admins", [])
-            
             # 获取代理配置
             self.enable_proxy = self.config.get("enable_proxy", False)
             self.proxy_url = self.config.get("proxy_url", "")
+            
+            # 获取baseurl配置
+            self.base_url = self.config.get("base_url", "https://generativelanguage.googleapis.com")
             
             # 初始化会话状态，用于保存上下文
             self.conversations = defaultdict(list)  # 用户ID -> 对话历史列表
@@ -112,6 +107,10 @@ class GeminiImage(Plugin):
             # 绑定事件处理函数
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
             
+            # 设置定期清理标志和最后清理时间
+            self._last_cleanup_time = time.time()
+            self._start_cleanup_thread()
+            
             logger.info("GeminiImage插件初始化成功")
             if self.enable_proxy:
                 logger.info(f"GeminiImage插件已启用代理: {self.proxy_url}")
@@ -121,6 +120,40 @@ class GeminiImage(Plugin):
             logger.exception(e)
             self.enable = False
     
+    def _start_cleanup_thread(self):
+        """启动一个后台线程用于定期清理"""
+        import threading
+        
+        # 定义清理函数
+        def cleanup_worker():
+            while True:
+                try:
+                    # 获取当前时间
+                    current_time = time.time()
+                    current_hour = time.localtime(current_time).tm_hour
+                    
+                    # 晚上2点到4点之间执行清理
+                    is_night_time = 2 <= current_hour <= 4
+                    time_since_last_cleanup = current_time - self._last_cleanup_time
+                    
+                    # 如果是夜间或者距离上次清理已经超过24小时，执行清理
+                    if is_night_time or time_since_last_cleanup > 24 * 3600:
+                        logger.info("执行定期清理临时文件")
+                        self._cleanup_temp_files()
+                        self._last_cleanup_time = current_time
+                
+                # 异常处理，确保线程不会因为错误而终止
+                except Exception as e:
+                    logger.error(f"清理线程发生错误: {str(e)}")
+                
+                # 每小时检查一次
+                time.sleep(3600)
+        
+        # 创建并启动后台线程
+        cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
+        cleanup_thread.start()
+        logger.info("临时文件清理线程已启动")
+
     def on_handle_context(self, e_context: EventContext):
         """处理消息事件"""
         if not self.enable:
@@ -131,6 +164,21 @@ class GeminiImage(Plugin):
         # 清理过期的会话和图片缓存
         self._cleanup_expired_conversations()
         self._cleanup_image_cache()
+        
+        # 基于时间的临时文件清理
+        current_time = time.time()
+        if not hasattr(self, '_last_cleanup_time'):
+            self._last_cleanup_time = current_time
+            
+        # 检查是否是深夜时段（凌晨2-4点之间）
+        current_hour = time.localtime(current_time).tm_hour
+        is_night_time = 2 <= current_hour <= 4
+        
+        # 如果是深夜时段，且距离上次清理已超过6小时，执行清理
+        if is_night_time and (current_time - self._last_cleanup_time) > 6 * 3600:
+            logger.info("执行夜间定时清理临时文件")
+            self._cleanup_temp_files()
+            self._last_cleanup_time = current_time
         
         # 会话标识: 用户ID+会话ID
         user_id = context["session_id"]
@@ -837,9 +885,60 @@ class GeminiImage(Plugin):
             if key in self.last_images:
                 del self.last_images[key]
     
+    def _cleanup_temp_files(self, max_age_hours=24):
+        """清理保存目录中的旧图片文件
+        
+        Args:
+            max_age_hours: 文件最大保留时间（小时）
+        """
+        try:
+            if not os.path.exists(self.save_dir):
+                return
+                
+            current_time = time.time()
+            max_age_seconds = max_age_hours * 3600
+            deleted_count = 0
+            
+            # 遍历save_dir目录下的所有文件
+            for filename in os.listdir(self.save_dir):
+                file_path = os.path.join(self.save_dir, filename)
+                
+                # 跳过目录
+                if os.path.isdir(file_path):
+                    continue
+                    
+                # 检查文件是否为插件生成的图片文件
+                if filename.startswith(("gemini_", "edited_", "temp_")):
+                    try:
+                        # 获取文件修改时间
+                        file_mod_time = os.path.getmtime(file_path)
+                        file_age = current_time - file_mod_time
+                        
+                        # 如果文件超过最大保留时间，则删除
+                        if file_age > max_age_seconds:
+                            # 检查文件是否在最后生成的图片路径中
+                            in_use = False
+                            for last_image in self.last_images.values():
+                                if file_path == last_image:
+                                    in_use = True
+                                    break
+                            
+                            # 如果文件不在使用中，删除它
+                            if not in_use:
+                                os.remove(file_path)
+                                deleted_count += 1
+                                logger.debug(f"清理临时图片文件: {file_path}")
+                    except Exception as e:
+                        logger.warning(f"清理临时文件时出错: {str(e)}")
+            
+            if deleted_count > 0:
+                logger.info(f"共清理 {deleted_count} 个临时图片文件")
+        except Exception as e:
+            logger.error(f"清理临时文件失败: {str(e)}")
+    
     def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API生成图片，返回图片数据和文本响应"""
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
+        url = f"{self.base_url}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
         headers = {
             "Content-Type": "application/json",
         }
@@ -979,7 +1078,7 @@ class GeminiImage(Plugin):
     
     def _edit_image(self, prompt: str, image_data: bytes, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
         """调用Gemini API编辑图片，返回图片数据和文本响应"""
-        url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
+        url = f"{self.base_url}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
         headers = {
             "Content-Type": "application/json",
         }

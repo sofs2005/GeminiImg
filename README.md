@@ -31,13 +31,10 @@
   "commands": ["$生成图片", "$画图", "$图片生成"],    # 生成图片的命令
   "edit_commands": ["$编辑图片", "$修改图片"],       # 编辑图片的命令
   "exit_commands": ["$结束对话", "$退出对话", "$关闭对话", "$结束"], # 结束对话的命令
-  "enable_points": false,                         # 是否启用积分系统
-  "generate_image_cost": 10,                      # 生成图片消耗的积分
-  "edit_image_cost": 15,                          # 编辑图片消耗的积分
   "save_path": "temp",                            # 图片保存路径
-  "admins": [],                                   # 管理员列表，这些用户不受积分限制
   "enable_proxy": false,                          # 是否启用代理
-  "proxy_url": ""                                 # 代理服务器URL
+  "proxy_url": "",                                 # 代理服务器URL
+  "base_url": "https://generativelanguage.googleapis.com"  # API基础URL
 }
 ```
 
