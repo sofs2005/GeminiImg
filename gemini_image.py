@@ -160,10 +160,27 @@ class GeminiImage(Plugin):
         self._cleanup_expired_conversations()
         self._cleanup_image_cache()
         
-        # 会话标识: 用户ID+会话ID
-        user_id = context["session_id"]
-        conversation_key = user_id
+        # 获取用户ID
+        user_id = context.get("from_user_id")
+        session_id = context.get("session_id")
         is_group = context.get("isgroup", False)
+        
+        # 获取消息对象
+        msg = None
+        if 'msg' in context.kwargs:
+            msg = context.kwargs['msg']
+            # 在群聊中，优先使用actual_user_id作为用户标识
+            if is_group and hasattr(msg, 'actual_user_id') and msg.actual_user_id:
+                user_id = msg.actual_user_id
+                logger.info(f"群聊中使用actual_user_id作为用户ID: {user_id}")
+            elif not is_group:
+                # 私聊中使用from_user_id
+                if hasattr(msg, 'from_user_id') and msg.from_user_id:
+                    user_id = msg.from_user_id
+                    logger.info(f"私聊中使用from_user_id作为用户ID: {user_id}")
+        
+        # 会话标识: 用户ID
+        conversation_key = user_id
         
         # 处理图片消息 - 用于缓存用户发送的图片
         if context.type == ContextType.IMAGE:
@@ -249,6 +266,12 @@ class GeminiImage(Plugin):
                 del self.waiting_for_reference_image[user_id]
                 if user_id in self.waiting_for_reference_image_time:
                     del self.waiting_for_reference_image_time[user_id]
+                
+                # 发送成功获取图片的提示
+                success_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
+                e_context["reply"] = success_reply
+                e_context.action = EventAction.BREAK_PASS
+                e_context["channel"].send(success_reply, e_context["context"])
                 
                 # 处理参考图片编辑
                 self._handle_reference_image_edit(e_context, user_id, prompt, image_base64)
@@ -616,11 +639,23 @@ class GeminiImage(Plugin):
                     e_context.action = EventAction.BREAK_PASS
                     return
                 
-                # 保存提示词，等待用户上传图片
+                # 检查是否启用积分系统且用户积分不足
+                if self.enable_points and user_id not in self.admins:
+                    user_points = self.get_user_points(user_id)
+                    if user_points < self.edit_image_cost:
+                        reply = Reply(ReplyType.TEXT, f"您的积分不足，编辑图片需要{self.edit_image_cost}积分，您当前有{user_points}积分")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                
+                # 记录用户正在等待上传参考图片
                 self.waiting_for_reference_image[user_id] = prompt
                 self.waiting_for_reference_image_time[user_id] = time.time()
                 
-                # 提示用户上传图片
+                # 记录日志
+                logger.info(f"用户 {user_id} 开始等待上传参考图片，提示词: {prompt}")
+                
+                # 发送提示消息
                 reply = Reply(ReplyType.TEXT, "请发送需要编辑的参考图片")
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
@@ -633,16 +668,23 @@ class GeminiImage(Plugin):
         is_group = context.get("isgroup", False)
         
         # 获取发送者ID，确保群聊和单聊场景都能正确缓存
-        sender_id = None
+        sender_id = context.get("from_user_id")  # 默认使用from_user_id
+        
         if 'msg' in context.kwargs:
             msg = context.kwargs['msg']
-            # 优先使用actual_user_id或from_user_id
-            if hasattr(msg, 'actual_user_id') and msg.actual_user_id:
+            
+            # 在群聊中，优先使用actual_user_id作为用户标识
+            if is_group and hasattr(msg, 'actual_user_id') and msg.actual_user_id:
                 sender_id = msg.actual_user_id
-                logger.info(f"使用actual_user_id作为发送者ID: {sender_id}")
-            elif hasattr(msg, 'from_user_id') and msg.from_user_id:
-                sender_id = msg.from_user_id
-                logger.info(f"使用from_user_id作为发送者ID: {sender_id}")
+                logger.info(f"群聊中使用actual_user_id作为发送者ID: {sender_id}")
+            elif not is_group:
+                # 私聊中使用from_user_id或session_id
+                if hasattr(msg, 'from_user_id') and msg.from_user_id:
+                    sender_id = msg.from_user_id
+                    logger.info(f"私聊中使用from_user_id作为发送者ID: {sender_id}")
+                else:
+                    sender_id = session_id
+                    logger.info(f"私聊中使用session_id作为发送者ID: {sender_id}")
             
             # 使用统一的图片获取方法获取图片数据
             image_data = self._get_image_data(msg, "")
@@ -661,7 +703,7 @@ class GeminiImage(Plugin):
                     logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，缓存键: {session_id}")
                     
                     # 检查是否有用户在等待上传参考图片
-                    if sender_id in self.waiting_for_reference_image:
+                    if sender_id and sender_id in self.waiting_for_reference_image:
                         prompt = self.waiting_for_reference_image[sender_id]
                         logger.info(f"检测到用户 {sender_id} 正在等待上传参考图片，提示词: {prompt}")
                         
@@ -673,9 +715,17 @@ class GeminiImage(Plugin):
                         if sender_id in self.waiting_for_reference_image_time:
                             del self.waiting_for_reference_image_time[sender_id]
                         
+                        # 发送成功获取图片的提示
+                        success_reply = Reply(ReplyType.TEXT, "成功获取图片，正在处理中...")
+                        e_context["reply"] = success_reply
+                        e_context.action = EventAction.BREAK_PASS
+                        e_context["channel"].send(success_reply, e_context["context"])
+                        
                         # 处理参考图片编辑
                         self._handle_reference_image_edit(e_context, sender_id, prompt, image_base64)
                         return
+                    else:
+                        logger.info(f"用户 {sender_id} 不在等待上传参考图片的列表中，或者sender_id为空")
                     
                     # 静默处理图片，不发送任何提示消息
                 except Exception as e:
@@ -1519,11 +1569,7 @@ class GeminiImage(Plugin):
             session_id = e_context["context"].get("session_id")
             conversation_key = session_id or user_id
             
-            # 发送处理中消息
-            processing_reply = Reply(ReplyType.TEXT, "正在编辑参考图片，请稍候...")
-            e_context["reply"] = processing_reply
-            e_context.action = EventAction.BREAK_PASS
-            e_context["channel"].send(processing_reply, e_context["context"])
+            # 注意：提示消息已在调用此方法前发送，此处不再重复发送
             
             # 检查图片数据是否有效
             if not image_base64 or len(image_base64) < 100:
@@ -1608,6 +1654,11 @@ class GeminiImage(Plugin):
                 
                 # 更新会话时间戳
                 self.last_conversation_time[conversation_key] = time.time()
+                
+                # 准备回复文本
+                reply_text = text_response if text_response else "参考图片编辑成功！"
+                if not conversation_history or len(conversation_history) <= 2:  # 如果是新会话
+                    reply_text += f"（已开始图像对话，可以继续发送命令修改图片。需要结束时请发送\"{self.exit_commands[0]}\"）"
                 
                 # 先发送文本消息
                 e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
