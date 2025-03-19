@@ -973,39 +973,155 @@ class GeminiImage(Plugin):
             else:
                 client = genai.Client(api_key=self.api_key)
             
-            # 直接使用提示文本，不需要复杂的会话处理
-            # 记录会话历史(仅日志)
-            if conversation_history and len(conversation_history) > 0:
-                logger.info(f"会话历史长度: {len(conversation_history)}，但在此实现中不使用历史")
+            # 修改提示词，明确要求生成图像
+            enhanced_prompt = f"生成一张图片: {prompt}。请确保返回图像内容，不仅仅是文字描述。"
             
-            # 调用API生成内容
-            response = client.models.generate_content(
-                model=self.model,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    response_modalities=['Text', 'Image']
+            # 使用直接生成内容方式
+            try:
+                logger.info("使用generate_content直接生成图片...")
+                
+                # 使用新的API方法生成图片
+                response = client.models.generate_content(
+                    model=self.model,
+                    contents=enhanced_prompt,
+                    config=types.GenerateContentConfig(
+                        response_modalities=['Text', 'Image']
+                    )
                 )
-            )
-            
-            # 从响应中提取文本和图像
-            text_response = None
-            image_bytes = None
-            
-            # 处理响应，寻找文本和图像
-            for part in response.candidates[0].content.parts:
-                if hasattr(part, 'text') and part.text:
-                    text_response = part.text
-                    logger.info(f"收到文本响应: {text_response[:100]}...")
-                elif hasattr(part, 'inline_data') and part.inline_data:
-                    logger.info("收到图像响应")
-                    image_bytes = base64.b64decode(part.inline_data.data)
-            
-            if not image_bytes:
-                logger.error("响应中没有图像数据")
-                return None, text_response if text_response else "未能生成图像"
-            
-            logger.info(f"图像生成成功，文本响应长度: {len(text_response) if text_response else 0}")
-            return image_bytes, text_response
+                
+                # 从响应中提取文本和图像
+                text_response = None
+                image_bytes = None
+                
+                # 安全地获取响应文本
+                if hasattr(response, 'text') and response.text is not None:
+                    text_response = response.text
+                    logger.info(f"收到文本响应: {text_response[:100] if text_response else '(空)'}")
+                else:
+                    logger.info("响应中没有text属性或为None")
+                
+                # 检查是否有candidates并安全地处理
+                if hasattr(response, 'candidates') and response.candidates:
+                    logger.info(f"找到{len(response.candidates)}个候选响应")
+                    
+                    for i, candidate in enumerate(response.candidates):
+                        logger.info(f"处理候选响应 #{i+1}")
+                        
+                        if hasattr(candidate, 'content') and candidate.content:
+                            if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                logger.info(f"候选响应有{len(candidate.content.parts)}个parts")
+                                
+                                # 遍历parts查找文本和图像
+                                for j, part in enumerate(candidate.content.parts):
+                                    logger.info(f"检查part #{j+1}, 类型: {type(part)}")
+                                    
+                                    # 提取文本
+                                    if hasattr(part, 'text') and part.text:
+                                        if not text_response:
+                                            text_response = part.text
+                                            logger.info(f"从candidates收到文本响应: {text_response[:100] if text_response else '(空)'}")
+                                    
+                                    # 提取图像数据
+                                    elif hasattr(part, 'inline_data') and part.inline_data:
+                                        logger.info("收到图像响应!")
+                                        try:
+                                            if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                                image_bytes = base64.b64decode(part.inline_data.data)
+                                                img_size = len(image_bytes) if image_bytes else 0
+                                                logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                            else:
+                                                logger.warning("inline_data没有data属性或为空")
+                                        except Exception as e:
+                                            logger.error(f"解码图像数据失败: {e}")
+                            else:
+                                logger.warning("candidate.content没有parts属性或为空")
+                        else:
+                            logger.warning("candidate没有content属性或为空")
+                else:
+                    logger.warning("响应中没有candidates属性或为空")
+                    
+                    # 尝试使用response.content
+                    if hasattr(response, 'content') and response.content:
+                        logger.info("尝试从response.content中获取内容")
+                        
+                        if hasattr(response.content, 'parts') and response.content.parts:
+                            for part in response.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    if not text_response:
+                                        text_response = part.text
+                                        logger.info(f"从content.parts获取文本: {text_response[:100] if text_response else '(空)'}")
+                                elif hasattr(part, 'inline_data') and part.inline_data:
+                                    logger.info("从content.parts获取图像!")
+                                    try:
+                                        if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                            image_bytes = base64.b64decode(part.inline_data.data)
+                                            img_size = len(image_bytes) if image_bytes else 0
+                                            logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                    except Exception as e:
+                                        logger.error(f"解码图像数据失败: {e}")
+                
+                # 检查是否获取到图像
+                if image_bytes and len(image_bytes) > 100:
+                    logger.info(f"图像生成成功，文本响应长度: {len(text_response) if text_response else 0}")
+                    return image_bytes, text_response or "图片生成成功！"
+                else:
+                    logger.error("响应中没有有效的图像数据，尝试修改提示词重新生成")
+                    
+                    # 尝试直接使用不依赖历史的新提示词
+                    direct_prompt = (
+                        "请为我生成并返回一张图片，内容是：" + prompt + 
+                        "。必须生成一张图片并在响应中包含图片数据。这是最重要的要求，不要只返回文字描述。"
+                    )
+                    
+                    # 再次尝试生成图片
+                    logger.info("使用新的提示词进行第二次尝试...")
+                    response = client.models.generate_content(
+                        model=self.model,
+                        contents=direct_prompt,
+                        config=types.GenerateContentConfig(
+                            response_modalities=['Text', 'Image']
+                        )
+                    )
+                    
+                    # 重置变量
+                    text_response = None
+                    image_bytes = None
+                    
+                    # 安全地获取响应文本
+                    if hasattr(response, 'text') and response.text is not None:
+                        text_response = response.text
+                        logger.info(f"二次尝试收到文本响应: {text_response[:100] if text_response else '(空)'}")
+                    
+                    # 安全地从响应中提取图像
+                    if hasattr(response, 'candidates') and response.candidates:
+                        for candidate in response.candidates:
+                            if hasattr(candidate, 'content') and candidate.content:
+                                if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, 'inline_data') and part.inline_data:
+                                            logger.info("二次尝试收到图像响应!")
+                                            try:
+                                                if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                                    image_bytes = base64.b64decode(part.inline_data.data)
+                                                    img_size = len(image_bytes) if image_bytes else 0
+                                                    logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                                    break
+                                            except Exception as e:
+                                                logger.error(f"解码图像数据失败: {e}")
+                    
+                    # 再次检查是否获取到有效图像
+                    if image_bytes and len(image_bytes) > 100:
+                        logger.info(f"二次尝试图像生成成功")
+                        return image_bytes, text_response or "图片生成成功！"
+                    else:
+                        # 如果尝试都失败了，则返回错误消息
+                        logger.error("两次尝试后仍无法获取图像数据")
+                        return None, text_response or "未能生成图像，请稍后再试或尝试不同的描述"
+                
+            except Exception as e:
+                logger.error(f"API调用失败: {e}")
+                logger.exception(e)
+                return None, f"生成图片时发生错误: {str(e)}"
             
         except Exception as e:
             logger.error(f"图像生成失败: {str(e)}")
@@ -1084,23 +1200,19 @@ class GeminiImage(Plugin):
                 logger.error(f"图像处理失败: {e}")
                 return None, f"图像处理失败: {e}"
             
-            # 构建文本请求和图像内容
-            text_input = f"Hi, here is an image. {prompt}"
-            
-            # 以最简单的方式构建请求
+            # 使用直接生成内容方式进行图像编辑
             try:
-                # 将PIL图像直接用于请求（与文档中的示例类似）
+                # 将PIL图像对象用于请求
                 pil_img = Image.open(BytesIO(image_data))
+                logger.info("使用generate_content直接编辑图片...")
                 
-                # 记录会话历史(仅日志)
-                if conversation_history and len(conversation_history) > 0:
-                    logger.info(f"会话历史长度: {len(conversation_history)}，但在此实现中不使用历史")
+                # 修改提示词，明确要求编辑图像并返回结果
+                enhanced_prompt = f"编辑这张图片: {prompt}。请确保返回修改后的图片。"
                 
-                # 调用API生成内容
-                logger.info("正在调用API编辑图像...")
+                # 使用新的API方法编辑图片
                 response = client.models.generate_content(
                     model=self.model,
-                    contents=[text_input, pil_img],
+                    contents=[enhanced_prompt, pil_img],
                     config=types.GenerateContentConfig(
                         response_modalities=['Text', 'Image']
                     )
@@ -1110,73 +1222,135 @@ class GeminiImage(Plugin):
                 text_response = None
                 image_bytes = None
                 
-                for part in response.candidates[0].content.parts:
-                    if hasattr(part, 'text') and part.text:
-                        text_response = part.text
-                        logger.info(f"收到文本响应: {text_response[:100]}...")
-                    elif hasattr(part, 'inline_data') and part.inline_data:
-                        logger.info("收到图像响应")
-                        image_bytes = base64.b64decode(part.inline_data.data)
+                # 安全地获取响应文本
+                if hasattr(response, 'text') and response.text is not None:
+                    text_response = response.text
+                    logger.info(f"收到文本响应: {text_response[:100] if text_response else '(空)'}")
+                else:
+                    logger.info("响应中没有text属性或为None")
                 
-                if not image_bytes:
-                    logger.error("响应中没有图像数据")
-                    return None, text_response if text_response else "未能生成修改后的图像"
-                
-                logger.info(f"图像编辑成功，文本响应长度: {len(text_response) if text_response else 0}")
-                return image_bytes, text_response
-                
-            except Exception as e:
-                logger.error(f"API调用失败: {e}")
-                logger.exception(e)
-                
-                # 尝试使用更基本的方法作为备选
-                try:
-                    logger.info("尝试使用备选方法发送图像...")
-                    # 将图像编码为base64
-                    encoded_image = base64.b64encode(image_data).decode("utf-8")
+                # 检查是否有candidates并安全地处理
+                if hasattr(response, 'candidates') and response.candidates:
+                    logger.info(f"找到{len(response.candidates)}个候选响应")
                     
-                    # 准备内容对象
-                    contents = [
-                        text_input,
-                        {
-                            "inline_data": {
-                                "mime_type": "image/png",
-                                "data": encoded_image
-                            }
-                        }
-                    ]
+                    for i, candidate in enumerate(response.candidates):
+                        logger.info(f"处理候选响应 #{i+1}")
+                        
+                        if hasattr(candidate, 'content') and candidate.content:
+                            if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                logger.info(f"候选响应有{len(candidate.content.parts)}个parts")
+                                
+                                # 遍历parts查找文本和图像
+                                for j, part in enumerate(candidate.content.parts):
+                                    logger.info(f"检查part #{j+1}, 类型: {type(part)}")
+                                    
+                                    # 提取文本
+                                    if hasattr(part, 'text') and part.text:
+                                        if not text_response:
+                                            text_response = part.text
+                                            logger.info(f"从candidates收到文本响应: {text_response[:100] if text_response else '(空)'}")
+                                    
+                                    # 提取图像数据
+                                    elif hasattr(part, 'inline_data') and part.inline_data:
+                                        logger.info("收到图像响应!")
+                                        try:
+                                            if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                                image_bytes = base64.b64decode(part.inline_data.data)
+                                                img_size = len(image_bytes) if image_bytes else 0
+                                                logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                            else:
+                                                logger.warning("inline_data没有data属性或为空")
+                                        except Exception as e:
+                                            logger.error(f"解码图像数据失败: {e}")
+                            else:
+                                logger.warning("candidate.content没有parts属性或为空")
+                        else:
+                            logger.warning("candidate没有content属性或为空")
+                else:
+                    logger.warning("响应中没有candidates属性或为空")
                     
+                    # 尝试使用response.content
+                    if hasattr(response, 'content') and response.content:
+                        logger.info("尝试从response.content中获取内容")
+                        
+                        if hasattr(response.content, 'parts') and response.content.parts:
+                            for part in response.content.parts:
+                                if hasattr(part, 'text') and part.text:
+                                    if not text_response:
+                                        text_response = part.text
+                                        logger.info(f"从content.parts获取文本: {text_response[:100] if text_response else '(空)'}")
+                                elif hasattr(part, 'inline_data') and part.inline_data:
+                                    logger.info("从content.parts获取图像!")
+                                    try:
+                                        if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                            image_bytes = base64.b64decode(part.inline_data.data)
+                                            img_size = len(image_bytes) if image_bytes else 0
+                                            logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                    except Exception as e:
+                                        logger.error(f"解码图像数据失败: {e}")
+                
+                # 检查是否获取到图像
+                if image_bytes and len(image_bytes) > 100:
+                    logger.info(f"图像编辑成功，文本响应长度: {len(text_response) if text_response else 0}")
+                    return image_bytes, text_response or "图片编辑成功！"
+                else:
+                    logger.error("响应中没有有效的图像数据，尝试修改提示词重新生成")
+                    
+                    # 尝试直接使用不依赖历史的新提示词
+                    direct_prompt = (
+                        "请编辑这张图片，按照以下要求：" + prompt + 
+                        "。必须返回修改后的图片，这是最重要的要求。不要只回复文字，确保输出包含图片。"
+                    )
+                    
+                    # 再次尝试编辑图片
+                    logger.info("使用新的提示词进行第二次尝试...")
                     response = client.models.generate_content(
                         model=self.model,
-                        contents=contents,
+                        contents=[direct_prompt, pil_img],
                         config=types.GenerateContentConfig(
                             response_modalities=['Text', 'Image']
                         )
                     )
                     
-                    # 从响应中提取文本和图像
+                    # 重置变量
                     text_response = None
                     image_bytes = None
                     
-                    for part in response.candidates[0].content.parts:
-                        if hasattr(part, 'text') and part.text:
-                            text_response = part.text
-                            logger.info(f"备选方法：收到文本响应: {text_response[:100]}...")
-                        elif hasattr(part, 'inline_data') and part.inline_data:
-                            logger.info("备选方法：收到图像响应")
-                            image_bytes = base64.b64decode(part.inline_data.data)
+                    # 安全地获取响应文本
+                    if hasattr(response, 'text') and response.text is not None:
+                        text_response = response.text
+                        logger.info(f"二次尝试收到文本响应: {text_response[:100] if text_response else '(空)'}")
                     
-                    if not image_bytes:
-                        logger.error("备选方法：响应中没有图像数据")
-                        return None, text_response if text_response else "未能生成修改后的图像"
+                    # 安全地从响应中提取图像
+                    if hasattr(response, 'candidates') and response.candidates:
+                        for candidate in response.candidates:
+                            if hasattr(candidate, 'content') and candidate.content:
+                                if hasattr(candidate.content, 'parts') and candidate.content.parts:
+                                    for part in candidate.content.parts:
+                                        if hasattr(part, 'inline_data') and part.inline_data:
+                                            logger.info("二次尝试收到图像响应!")
+                                            try:
+                                                if hasattr(part.inline_data, 'data') and part.inline_data.data:
+                                                    image_bytes = base64.b64decode(part.inline_data.data)
+                                                    img_size = len(image_bytes) if image_bytes else 0
+                                                    logger.info(f"解码图像数据，大小: {img_size} 字节")
+                                                    break
+                                            except Exception as e:
+                                                logger.error(f"解码图像数据失败: {e}")
                     
-                    logger.info(f"备选方法：图像编辑成功")
-                    return image_bytes, text_response
-                    
-                except Exception as backup_e:
-                    logger.error(f"备选方法也失败: {backup_e}")
-                    logger.exception(backup_e)
-                    return None, f"编辑图片时发生错误: {e}，备选方法也失败: {backup_e}"
+                    # 再次检查是否获取到有效图像
+                    if image_bytes and len(image_bytes) > 100:
+                        logger.info(f"二次尝试图像编辑成功")
+                        return image_bytes, text_response or "图片编辑成功！"
+                    else:
+                        # 如果尝试都失败了，则返回错误消息
+                        logger.error("两次尝试后仍无法获取图像数据")
+                        return None, text_response or "未能编辑图像，请稍后再试或尝试不同的描述"
+                
+            except Exception as e:
+                logger.error(f"API调用失败: {e}")
+                logger.exception(e)
+                return None, f"编辑图片时发生错误: {str(e)}"
             
         except Exception as e:
             logger.error(f"图像编辑失败: {str(e)}")
