@@ -89,6 +89,7 @@ class GeminiImage(Plugin):
             self.commands = self.config.get("commands", ["g生成图片", "g画图", "g画一个"])
             self.edit_commands = self.config.get("edit_commands", ["g编辑图片", "g改图"])
             self.reference_edit_commands = self.config.get("reference_edit_commands", ["g参考图", "g编辑参考图"])
+            self.merge_commands = self.config.get("merge_commands", ["g融图"])
             self.image_reverse_commands = self.config.get("image_reverse_commands", ["g反推提示", "g反推"])
             self.image_analysis_commands = self.config.get("image_analysis_commands", ["g分析图片", "g识图"])
             self.follow_up_commands = self.config.get("follow_up_commands", ["g追问"])
