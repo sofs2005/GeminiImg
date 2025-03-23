@@ -4,6 +4,7 @@
   "model": "gemini-2.0-flash-exp-image-generation",
   "commands": ["g生成图片", "g画图", "g画一个"],
   "edit_commands": ["g编辑图片", "g改图"],
+  "merge_commands": ["g融图"],
   "reference_edit_commands": ["g参考图", "g编辑参考图"],
   "image_analysis_commands": ["g解析图片", "g识图"],
   "image_reverse_commands": ["g反推提示", "g反推"],
