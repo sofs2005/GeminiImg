@@ -795,13 +795,7 @@ class GeminiImage(Plugin):
                     e_context["reply"] = reply
                     e_context.action = EventAction.BREAK_PASS
                     return
-            
-            # 如果没有特殊处理逻辑，返回默认回复
-            reply = Reply(ReplyType.TEXT, "图片已成功缓存")
-            e_context["reply"] = reply
-            e_context.action = EventAction.BREAK_PASS
-            return
-    
+                
     def _get_recent_image(self, conversation_key: str) -> Optional[bytes]:
         """获取最近的图片数据，支持群聊和单聊场景
         
