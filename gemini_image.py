@@ -43,7 +43,9 @@ class GeminiImage(Plugin):
         "edit_commands": ["g编辑图片", "g改图"],
         "reference_edit_commands": ["g参考图", "g编辑参考图"],
         "merge_commands": ["g融图"],
-        "image_analysis_commands": ["g解析图片", "g识图"],
+        "image_reverse_commands": ["g反推提示", "g反推"],
+        "image_analysis_commands": ["g分析图片", "g识图"],
+        "follow_up_commands": ["g追问"],
         "exit_commands": ["g结束对话", "g结束"],
         "enable_points": False,
         "generate_image_cost": 10,
@@ -60,7 +62,7 @@ class GeminiImage(Plugin):
         "enable_translate": True,
         "translate_on_commands": ["g开启翻译", "g启用翻译"],
         "translate_off_commands": ["g关闭翻译", "g禁用翻译"],
-        "image_prompt": "请详细分析这张图片的内容，包括主要对象、场景、风格、颜色等关键特征。如果图片包含文字，也请提取出来。请用简洁清晰的中文进行描述。"
+        "reverse_prompt": ""
     }
 
     def __init__(self):
@@ -87,7 +89,9 @@ class GeminiImage(Plugin):
             self.commands = self.config.get("commands", ["g生成图片", "g画图", "g画一个"])
             self.edit_commands = self.config.get("edit_commands", ["g编辑图片", "g改图"])
             self.reference_edit_commands = self.config.get("reference_edit_commands", ["g参考图", "g编辑参考图"])
-            self.image_analysis_commands = self.config.get("image_analysis_commands", ["g解析图片", "g识图"])
+            self.image_reverse_commands = self.config.get("image_reverse_commands", ["g反推提示", "g反推"])
+            self.image_analysis_commands = self.config.get("image_analysis_commands", ["g分析图片", "g识图"])
+            self.follow_up_commands = self.config.get("follow_up_commands", ["g追问"])
             self.exit_commands = self.config.get("exit_commands", ["g结束对话", "g结束"])
             
             # 获取积分配置
@@ -134,16 +138,26 @@ class GeminiImage(Plugin):
             self.reference_image_wait_timeout = 180  # 等待参考图片的超时时间(秒)，3分钟
             
             # 初始化图片分析状态
-            self.waiting_for_analysis_image = {}  # 用户ID -> 是否等待分析图片
-            self.waiting_for_analysis_image_time = {}  # 用户ID -> 开始等待分析图片的时间戳
-            self.analysis_image_wait_timeout = 180  # 等待分析图片的超时时间(秒)，3分钟
+            self.waiting_for_reverse_image = {}  # 用户ID -> 是否等待反推图片
+            self.waiting_for_reverse_image_time = {}  # 用户ID -> 开始等待反推图片的时间戳
+            self.reverse_image_wait_timeout = 180  # 等待反推图片的超时时间(秒)，3分钟
+            
+            # 初始化识图状态
+            self.waiting_for_analysis_image = {}  # 用户ID -> 等待识图的问题
+            self.waiting_for_analysis_image_time = {}  # 用户ID -> 开始等待识图的时间戳
+            self.analysis_image_wait_timeout = 180  # 等待识图的超时时间(秒)，3分钟
             
             # 初始化图片缓存，用于存储用户上传的图片
             self.image_cache = {}  # 会话ID/用户ID -> {"data": 图片数据, "timestamp": 时间戳}
             self.image_cache_timeout = 600  # 图片缓存过期时间(秒)
             
+            # 初始化追问状态
+            self.last_analysis_image = {}  # 用户ID -> 最后一次识图的图片数据
+            self.last_analysis_time = {}  # 用户ID -> 最后一次识图的时间戳
+            self.follow_up_timeout = 180  # 追问超时时间(秒)，3分钟
+            
             # 获取图片分析提示词
-            self.image_prompt = self.config.get("image_prompt", "请详细分析这张图片的内容，包括主要对象、场景、风格、颜色等关键特征。如果图片包含文字，也请提取出来。请用简洁清晰的中文进行描述。")
+            self.reverse_prompt = self.config.get("reverse_prompt", "请详细分析这张图片的内容，包括主要对象、场景、风格、颜色等关键特征。如果图片包含文字，也请提取出来。请用简洁清晰的中文进行描述。")
             
             # 验证关键配置
             if not self.api_key:
@@ -205,15 +219,77 @@ class GeminiImage(Plugin):
         
         content = context.content.strip()
         
-        # 检查是否是识图命令
-        for cmd in self.image_analysis_commands:
+        # 检查是否是反推提示词命令
+        for cmd in self.image_reverse_commands:
             if content == cmd:
                 # 设置等待图片状态
-                self.waiting_for_analysis_image[user_id] = True
+                self.waiting_for_reverse_image[user_id] = True
+                self.waiting_for_reverse_image_time[user_id] = time.time()
+                
+                # 提示用户上传图片
+                reply = Reply(ReplyType.TEXT, "请在3分钟内发送需要反推提示词的图片")
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+                
+        # 检查是否是识图命令
+        for cmd in self.image_analysis_commands:
+            # 检查是否包含问题
+            if content.startswith(cmd):
+                question = content[len(cmd):].strip()
+                # 设置等待图片状态，并保存问题
+                self.waiting_for_analysis_image[user_id] = question if question else "分析这张图片的内容，包括主要对象、场景、风格、颜色等关键特征，用简洁清晰的中文进行描述。"
                 self.waiting_for_analysis_image_time[user_id] = time.time()
                 
                 # 提示用户上传图片
                 reply = Reply(ReplyType.TEXT, "请在3分钟内发送需要gemini识别的图片")
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+                
+        # 检查是否是追问命令
+        for cmd in self.follow_up_commands:
+            if content.startswith(cmd):
+                # 检查是否有最近的识图记录
+                if user_id not in self.last_analysis_image or user_id not in self.last_analysis_time:
+                    reply = Reply(ReplyType.TEXT, "没有找到最近的识图记录，请先使用识图功能")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                # 检查是否超时
+                if time.time() - self.last_analysis_time[user_id] > self.follow_up_timeout:
+                    # 清理状态
+                    del self.last_analysis_image[user_id]
+                    del self.last_analysis_time[user_id]
+                    
+                    reply = Reply(ReplyType.TEXT, "追问超时，请重新使用识图功能")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                # 提取追问问题
+                question = content[len(cmd):].strip() if len(content) > len(cmd) else "请继续分析这张图片"
+                # 添加中文回答要求
+                question = question + "，请用简洁的中文进行回答。"
+                
+                try:
+                    # 调用API分析图片
+                    analysis_result = self._analyze_image(self.last_analysis_image[user_id], question)
+                    if analysis_result:
+                        # 更新时间戳
+                        self.last_analysis_time[user_id] = time.time()
+                        
+                        # 添加追问提示
+                        analysis_result += "\n💬3min内输入g追问+问题，可继续追问"
+                        reply = Reply(ReplyType.TEXT, analysis_result)
+                    else:
+                        reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
+                except Exception as e:
+                    logger.error(f"处理追问请求异常: {str(e)}")
+                    logger.exception(e)
+                    reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
+                
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -749,6 +825,46 @@ class GeminiImage(Plugin):
                         # 处理参考图片编辑
                         self._handle_reference_image_edit(e_context, sender_id, prompt, image_base64)
                         return
+                    # 检查是否有用户在等待反推提示词
+                    elif sender_id and sender_id in self.waiting_for_reverse_image:
+                        # 检查是否超时
+                        if time.time() - self.waiting_for_reverse_image_time[sender_id] > self.reverse_image_wait_timeout:
+                            # 清理状态
+                            del self.waiting_for_reverse_image[sender_id]
+                            del self.waiting_for_reverse_image_time[sender_id]
+                            
+                            reply = Reply(ReplyType.TEXT, "图片上传超时，请重新发送反推提示词命令")
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+                        
+                        try:
+                            # 调用API分析图片
+                            reverse_result = self._reverse_image(image_data)
+                            if reverse_result:
+                                reply = Reply(ReplyType.TEXT, reverse_result)
+                            else:
+                                reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
+                            
+                            # 清理状态
+                            del self.waiting_for_reverse_image[sender_id]
+                            del self.waiting_for_reverse_image_time[sender_id]
+                            
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return
+                        except Exception as e:
+                            logger.error(f"处理反推请求异常: {str(e)}")
+                            logger.exception(e)
+                            
+                            # 清理状态
+                            del self.waiting_for_reverse_image[sender_id]
+                            del self.waiting_for_reverse_image_time[sender_id]
+                            
+                            reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
+                            e_context["reply"] = reply
+                            e_context.action = EventAction.BREAK_PASS
+                            return
                     # 检查是否有用户在等待识图
                     elif sender_id and sender_id in self.waiting_for_analysis_image:
                         # 检查是否超时
@@ -763,9 +879,18 @@ class GeminiImage(Plugin):
                             return
                         
                         try:
+                            # 获取用户的问题或默认提示词
+                            question = self.waiting_for_analysis_image[sender_id]
+                            
                             # 调用API分析图片
-                            analysis_result = self._analyze_image(image_data)
+                            analysis_result = self._analyze_image(image_data, question)
                             if analysis_result:
+                                # 缓存图片数据和时间戳，用于后续追问
+                                self.last_analysis_image[sender_id] = image_data
+                                self.last_analysis_time[sender_id] = time.time()
+                                
+                                # 添加追问提示
+                                analysis_result += "\n💬3min内输入g追问+问题，可继续追问"
                                 reply = Reply(ReplyType.TEXT, analysis_result)
                             else:
                                 reply = Reply(ReplyType.TEXT, "图片分析失败，请稍后重试")
@@ -778,12 +903,12 @@ class GeminiImage(Plugin):
                             e_context.action = EventAction.BREAK_PASS
                             return
                         except Exception as e:
-                            logger.error(f"处理识图请求异常: {str(e)}")
+                            logger.error(f"处理反推请求异常: {str(e)}")
                             logger.exception(e)
                             
                             # 清理状态
-                            del self.waiting_for_analysis_image[sender_id]
-                            del self.waiting_for_analysis_image_time[sender_id]
+                            del self.waiting_for_reverse_image[sender_id]
+                            del self.waiting_for_reverse_image_time[sender_id]
                             
                             reply = Reply(ReplyType.TEXT, f"图片分析失败: {str(e)}")
                             e_context["reply"] = reply
@@ -1408,39 +1533,6 @@ class GeminiImage(Plugin):
                 "translate_on_commands": ["g开启翻译", "g启用翻译"],
                 "translate_off_commands": ["g关闭翻译", "g禁用翻译"]
             }
-    
-    def get_help_text(self, verbose=False, **kwargs):
-        help_text = "基于Google Gemini的图像生成插件\n"
-        help_text += "可以生成和编辑图片，支持连续对话\n\n"
-        help_text += "使用方法：\n"
-        help_text += f"1. 生成图片：发送 {self.commands[0]} + 描述，例如：{self.commands[0]} 一只可爱的猫咪\n"
-        help_text += f"2. 编辑图片：发送 {self.edit_commands[0]} + 描述，例如：{self.edit_commands[0]} 给猫咪戴上帽子\n"
-        help_text += f"3. 参考图编辑：发送 {self.reference_edit_commands[0]} + 描述，然后上传图片\n"
-        help_text += f"4. 融图：发送 {self.merge_commands[0]} + 描述，然后按顺序上传两张图片\n"
-        help_text += f"5. 继续对话：直接发送描述，例如：把帽子换成红色的\n"
-        help_text += f"6. 结束对话：发送 {self.exit_commands[0]}\n\n"
-        
-        if self.enable_translate:
-            help_text += "特色功能：\n"
-            help_text += "* 前置翻译：所有以g开头的指令会自动将中文提示词翻译成英文，然后再调用Gemini API进行图像生成或编辑，提高生成质量\n"
-            help_text += f"* 开启翻译：发送 {self.translate_on_commands[0]} 可以开启前置翻译功能\n"
-            help_text += f"* 关闭翻译：发送 {self.translate_off_commands[0]} 可以关闭前置翻译功能\n\n"
-        
-        if verbose:
-            help_text += "配置说明：\n"
-            help_text += "* 在config.json中可以自定义触发命令和其他设置\n"
-            help_text += "* 可以设置代理或代理服务，解决网络访问问题\n"
-            
-            if self.enable_translate:
-                help_text += "* 可以通过enable_translate选项开启或关闭前置翻译功能\n"
-                help_text += "* 每个用户可以单独控制是否启用翻译功能\n"
-            
-            help_text += "\n注意事项：\n"
-            help_text += "* 图片生成可能需要一些时间，请耐心等待\n"
-            help_text += "* 会话有效期为10分钟，超时后需要重新开始\n"
-            help_text += "* 不支持生成违反内容政策的图片\n"
-        
-        return help_text
 
     def _get_image_data(self, msg, image_path_or_data):
         """
@@ -1619,7 +1711,7 @@ class GeminiImage(Plugin):
             logger.error(f"获取图片数据失败: {e}")
             return None
 
-    def _analyze_image(self, image_data: bytes) -> Optional[str]:
+    def _reverse_image(self, image_data: bytes) -> Optional[str]:
         """调用Gemini API分析图片内容"""
         try:
             # 将图片转换为Base64格式
@@ -1637,7 +1729,7 @@ class GeminiImage(Plugin):
                                 }
                             },
                             {
-                                "text": self.image_prompt
+                                "text": self.reverse_prompt
                             }
                         ]
                     }
@@ -1697,6 +1789,100 @@ class GeminiImage(Plugin):
                 return None
         except Exception as e:
             logger.error(f"图片分析异常: {str(e)}")
+            logger.exception(e)
+            return None
+
+    def _analyze_image(self, image_data: bytes, question: Optional[str] = None) -> Optional[str]:
+        """分析图片内容或回答关于图片的问题
+        
+        Args:
+            image_data: 图片二进制数据
+            question: 可选，用户关于图片的具体问题
+            
+        Returns:
+            str: 分析结果或问题的回答
+        """
+        try:
+            # 将图片数据转换为base64格式
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            
+            # 构建请求数据
+            data = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "inlineData": {
+                                    "mimeType": "image/jpeg",
+                                    "data": image_base64
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
+            
+            # 如果有具体问题，添加到请求中
+            if question:
+                data["contents"][0]["parts"].append({"text": question})
+            else:
+                # 使用默认的分析提示词
+                default_prompt = "请仔细观察这张图片的内容，然后用简洁清晰的中文回答用户的问题。如用户没有提出额外问题，则简单描述图片中的主体、场景、风格、颜色等关键要素。如果图片包含文字，也请提取出来。"
+                data["contents"][0]["parts"].append({"text": default_prompt})
+            
+            # 根据配置决定使用直接调用还是通过代理服务调用
+            if self.use_proxy_service and self.proxy_service_url:
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+                headers = {
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
+                }
+                params = {}
+            else:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+                headers = {
+                    "Content-Type": "application/json",
+                }
+                params = {
+                    "key": self.api_key
+                }
+            
+            # 创建代理配置
+            proxies = None
+            if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+                proxies = {
+                    "http": self.proxy_url,
+                    "https": self.proxy_url
+                }
+            
+            # 发送请求
+            response = requests.post(
+                url,
+                headers=headers,
+                params=params,
+                json=data,
+                proxies=proxies,
+                timeout=60
+            )
+            
+            if response.status_code == 200:
+                result = response.json()
+                candidates = result.get("candidates", [])
+                if candidates and len(candidates) > 0:
+                    content = candidates[0].get("content", {})
+                    parts = content.get("parts", [])
+                    
+                    # 提取文本响应
+                    for part in parts:
+                        if "text" in part:
+                            return part["text"]
+                
+                return None
+            else:
+                logger.error(f"图片分析API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"分析图片失败: {str(e)}")
             logger.exception(e)
             return None
 
@@ -1832,3 +2018,41 @@ class GeminiImage(Plugin):
             reply = Reply(ReplyType.TEXT, f"处理参考图片失败: {str(e)}")
             e_context["reply"] = reply
             e_context.action = EventAction.BREAK_PASS
+    
+    def get_help_text(self, verbose=False, **kwargs):
+        help_text = "基于Google Gemini的图像生成插件\n"
+        help_text += "可以生成和编辑图片，支持连续对话\n\n"
+        help_text += "使用方法：\n"
+        help_text += f"1. 生成图片：发送 {self.commands[0]} + 描述，例如：{self.commands[0]} 一只可爱的猫咪\n"
+        help_text += f"2. 编辑图片：发送 {self.edit_commands[0]} + 描述，例如：{self.edit_commands[0]} 给猫咪戴上帽子\n"
+        help_text += f"3. 参考图编辑：发送 {self.reference_edit_commands[0]} + 描述，然后上传图片\n"
+        help_text += f"4. 融图：发送 {self.merge_commands[0]} + 描述，然后按顺序上传两张图片\n"
+        help_text += f"5. 识图：发送 {self.image_analysis_commands[0]} 然后上传图片，或发送问题后上传图片\n"
+        help_text += f"6. 反推提示：发送 {self.image_reverse_commands[0]} 然后上传图片，分析图片特征\n"
+        help_text += f"7. 追问：发送 {self.follow_up_commands[0]} + 问题，对已识别的图片进行追加提问\n"
+        help_text += f"8. 继续对话：直接发送描述，例如：把帽子换成红色的\n"
+        help_text += f"9. 结束对话：发送 {self.exit_commands[0]}\n\n"
+        
+        if self.enable_translate:
+            help_text += "特色功能：\n"
+            help_text += "* 前置翻译：所有以g开头的指令会自动将中文提示词翻译成英文，然后再调用Gemini API进行图像生成或编辑，提高生成质量\n"
+            help_text += f"* 开启翻译：发送 {self.translate_on_commands[0]} 可以开启前置翻译功能\n"
+            help_text += f"* 关闭翻译：发送 {self.translate_off_commands[0]} 可以关闭前置翻译功能\n\n"
+        
+        if verbose:
+            help_text += "配置说明：\n"
+            help_text += "* 在config.json中可以自定义触发命令和其他设置\n"
+            help_text += "* 可以设置代理或代理服务，解决网络访问问题\n"
+            
+            if self.enable_translate:
+                help_text += "* 可以通过enable_translate选项开启或关闭前置翻译功能\n"
+                help_text += "* 每个用户可以单独控制是否启用翻译功能\n"
+            
+            help_text += "\n注意事项：\n"
+            help_text += "* 图片生成可能需要一些时间，请耐心等待\n"
+            help_text += "* 会话有效期为10分钟，超时后需要重新开始\n"
+            help_text += "* 不支持生成违反内容政策的图片\n"
+            help_text += "* 识图和追问功能的等待时间为3分钟\n"
+            help_text += "* 追问功能仅在最近一次识图后的3分钟内有效\n"
+        
+        return help_text
