@@ -21,7 +21,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
-    version="1.1.0",
+    version="1.2.0",
     author="sofs2005",
 )
 class GeminiImage(Plugin):
@@ -1112,7 +1112,7 @@ class GeminiImage(Plugin):
                 params=params, 
                 json=data,
                 proxies=proxies,
-                timeout=60  # 增加超时时间到60秒
+                timeout=120  # 增加超时时间到120秒，解决多图文任务超时问题
             )
             
             logger.info(f"Gemini API响应状态码: {response.status_code}")
@@ -1296,7 +1296,7 @@ class GeminiImage(Plugin):
                 params=params, 
                 json=data,
                 proxies=proxies,
-                timeout=60  # 增加超时时间到60秒
+                timeout=120  # 增加超时时间到120秒，解决多图文任务超时问题
             )
             
             logger.info(f"Gemini API响应状态码: {response.status_code}")
