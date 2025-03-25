@@ -352,11 +352,16 @@ class GeminiImage(Plugin):
                             else:
                                 e_context["channel"].send(Reply(ReplyType.TEXT, "图片生成失败，请稍后再试或修改提示词"), e_context["context"])
                             e_context.action = EventAction.BREAK_PASS
+                        else:
+                            # 没有有效的文本响应或图片，返回一个通用错误消息并中断处理
+                            e_context["channel"].send(Reply(ReplyType.TEXT, "图片生成失败，请稍后再试或修改提示词"), e_context["context"])
+                            e_context.action = EventAction.BREAK_PASS
                 except Exception as e:
                     logger.error(f"生成图片失败: {str(e)}")
                     logger.exception(e)
                     reply_text = f"生成图片失败: {str(e)}"
                     e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
+                    # 确保在异常情况下也设置正确的action，防止命令继续传递
                     e_context.action = EventAction.BREAK_PASS
                 return
 
@@ -519,6 +524,7 @@ class GeminiImage(Plugin):
                     logger.exception(e)
                     reply_text = f"编辑图片失败: {str(e)}"
                     e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
+                    # 确保在异常情况下也设置正确的action，防止命令继续传递
                     e_context.action = EventAction.BREAK_PASS
                 return
 
@@ -667,6 +673,7 @@ class GeminiImage(Plugin):
                 logger.exception(e)
                 reply_texts = [f"处理失败: {str(e)}"]
                 e_context["channel"].send(Reply(ReplyType.TEXT, reply_texts[0]), e_context["context"])
+                # 确保在异常情况下也设置正确的action，防止命令继续传递
                 e_context.action = EventAction.BREAK_PASS
             return
     
