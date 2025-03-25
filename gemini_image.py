@@ -549,6 +549,18 @@ class GeminiImage(Plugin):
                 result_image_datas, text_responses = self._edit_image(content, image_datas, conversation_history)
                 
                 if result_image_datas:
+                    # 初始化clean_texts变量
+                    if text_responses and any(text is not None for text in text_responses):
+                        # 过滤掉None值
+                        valid_responses = [text for text in text_responses if text]
+                        if valid_responses:
+                            clean_texts = [text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_") for text in valid_responses]
+                            clean_texts = [text[:30] + "..." if len(text) > 30 else text for text in clean_texts]
+                        else:
+                            clean_texts = ["edited_image"]  # 默认名称
+                    else:
+                        clean_texts = ["edited_image"]  # 默认名称
+                    
                     # 保存编辑后的图片
                     edited_image_paths = []
                     for i, result_image_data in enumerate(result_image_datas):
