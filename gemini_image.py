@@ -21,7 +21,7 @@ from plugins import *
     desire_priority=20,
     hidden=False,
     desc="基于Google Gemini的图像生成插件",
-    version="1.2.0",
+    version="2.0.0",
     author="sofs2005",
 )
 class GeminiImage(Plugin):
@@ -198,22 +198,30 @@ class GeminiImage(Plugin):
         
         # 检查是否是结束对话命令
         if content in self.exit_commands:
-            if conversation_key in self.conversations:
-                # 清除会话数据
-                del self.conversations[conversation_key]
-                if conversation_key in self.conversation_timestamps:
-                    del self.conversation_timestamps[conversation_key]
-                if conversation_key in self.last_images:
-                    del self.last_images[conversation_key]
-                
-                reply = Reply(ReplyType.TEXT, "已结束Gemini图像生成对话，下次需要时请使用命令重新开始")
+            try:
+                if conversation_key in self.conversations:
+                    # 清除会话数据
+                    del self.conversations[conversation_key]
+                    if conversation_key in self.conversation_timestamps:
+                        del self.conversation_timestamps[conversation_key]
+                    if conversation_key in self.last_images:
+                        del self.last_images[conversation_key]
+                    
+                    reply = Reply(ReplyType.TEXT, "已结束Gemini图像生成对话，下次需要时请使用命令重新开始")
+                    e_context["channel"].send(reply, e_context["context"])
+                else:
+                    # 没有活跃会话
+                    reply = Reply(ReplyType.TEXT, "您当前没有活跃的Gemini图像生成对话")
+                    e_context["channel"].send(reply, e_context["context"])
+            except Exception as e:
+                logger.error(f"结束对话出错: {str(e)}")
+                logger.exception(e)
+                reply = Reply(ReplyType.TEXT, f"结束对话出错: {str(e)}")
                 e_context["channel"].send(reply, e_context["context"])
+            finally:
+                # 确保在任何情况下都设置action为BREAK_PASS
                 e_context.action = EventAction.BREAK_PASS
-            else:
-                # 没有活跃会话
-                reply = Reply(ReplyType.TEXT, "您当前没有活跃的Gemini图像生成对话")
-                e_context["channel"].send(reply, e_context["context"])
-                e_context.action = EventAction.BREAK_PASS
+                logger.info("退出对话命令已处理，设置action为BREAK_PASS")
             return
 
         # 检查是否是生成图片命令
@@ -234,7 +242,7 @@ class GeminiImage(Plugin):
                     e_context.action = EventAction.BREAK_PASS
                     return
                 
-                # 尝试生成图片
+                # 在处理命令时设置标记，确保无论是否出现异常都会拦截命令
                 try:
                     # 发送处理中消息
                     processing_reply = Reply(ReplyType.TEXT, "正在生成图片，请稍候...")
@@ -273,23 +281,31 @@ class GeminiImage(Plugin):
                         # 只有在成功保存了图片时才更新和处理会话
                         if image_paths:
                             # 保存最后生成的图片路径
-                            self.last_images[conversation_key] = image_paths
+                            if len(image_paths) > 0:
+                                self.last_images[conversation_key] = image_paths
+                                logger.info(f"保存最后生成的图片路径: {image_paths}")
+                            else:
+                                # 如果没有图片（此处逻辑上不会执行，但保留以防万一）
+                                self.last_images[conversation_key] = None
                             
                             # 添加用户提示到会话
                             user_messages = [{"role": "user", "parts": [{"text": prompt}]} for prompt in prompt.split()]
                             conversation_history.extend(user_messages)
                             
                             # 添加助手回复到会话
-                            assistant_messages = [
-                                {
+                            assistant_messages = []
+                            for i in range(len(image_paths)):
+                                text = None
+                                if i < len(text_responses):
+                                    text = text_responses[i]
+                                
+                                assistant_messages.append({
                                     "role": "model", 
                                     "parts": [
-                                        {"text": text_response if text_response else "我已生成了图片"},
-                                        {"image_url": image_path}
+                                        {"text": text if text else "我已生成了图片"},
+                                        {"image_url": image_paths[i]}
                                     ]
-                                }
-                                for text_response, image_path in zip(text_responses, image_paths)
-                            ]
+                                })
                             conversation_history.extend(assistant_messages)
                             
                             # 限制会话历史长度
@@ -301,16 +317,24 @@ class GeminiImage(Plugin):
                             
                             # 先发送文本消息
                             has_sent_text = False
-                            for i, (text_response, image_data) in enumerate(zip(text_responses, image_datas)):
-                                if text_response:  # 如果有文本，先发送文本
-                                    e_context["channel"].send(Reply(ReplyType.TEXT, text_response), e_context["context"])
+                            
+                            # 确定要遍历的最大长度，取图片和文本列表中的最大长度
+                            max_length = max(len(image_datas), len(text_responses))
+                            
+                            for i in range(max_length):
+                                # 获取当前索引的图片和文本（如果存在）
+                                img_data = image_datas[i] if i < len(image_datas) else None
+                                text = text_responses[i] if i < len(text_responses) else None
+                                
+                                if text:  # 如果有文本，先发送文本
+                                    e_context["channel"].send(Reply(ReplyType.TEXT, text), e_context["context"])
                                     has_sent_text = True  # 标记已发送文本
                                 
-                                if image_data:  # 如果有图片，再发送图片
+                                if img_data:  # 如果有图片，再发送图片
                                     # 创建临时文件保存图片，每个图片都需要单独发送
                                     temp_image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}_{i}.png")
                                     with open(temp_image_path, "wb") as f:
-                                        f.write(image_data)
+                                        f.write(img_data)
                                     
                                     # 单独发送每张图片
                                     image_file = open(temp_image_path, "rb")
@@ -337,8 +361,6 @@ class GeminiImage(Plugin):
                                             e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
                                         else:
                                             e_context["channel"].send(Reply(ReplyType.TEXT, "图片生成失败，请稍后再试或修改提示词"), e_context["context"])
-                            # 确保只设置一次action
-                            e_context.action = EventAction.BREAK_PASS
                     else:
                         # 检查是否有文本响应，可能是内容被拒绝
                         if text_responses and any(text is not None for text in text_responses):
@@ -351,18 +373,18 @@ class GeminiImage(Plugin):
                                 e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
                             else:
                                 e_context["channel"].send(Reply(ReplyType.TEXT, "图片生成失败，请稍后再试或修改提示词"), e_context["context"])
-                            e_context.action = EventAction.BREAK_PASS
                         else:
-                            # 没有有效的文本响应或图片，返回一个通用错误消息并中断处理
+                            # 如果没有任何响应，发送默认失败消息
                             e_context["channel"].send(Reply(ReplyType.TEXT, "图片生成失败，请稍后再试或修改提示词"), e_context["context"])
-                            e_context.action = EventAction.BREAK_PASS
                 except Exception as e:
                     logger.error(f"生成图片失败: {str(e)}")
                     logger.exception(e)
                     reply_text = f"生成图片失败: {str(e)}"
                     e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                    # 确保在异常情况下也设置正确的action，防止命令继续传递
+                finally:
+                    # 确保在任何情况下都设置action为BREAK_PASS
                     e_context.action = EventAction.BREAK_PASS
+                    logger.info("图片生成命令已处理，设置action为BREAK_PASS")
                 return
 
         # 检查是否是编辑图片命令
@@ -383,73 +405,99 @@ class GeminiImage(Plugin):
                     e_context.action = EventAction.BREAK_PASS
                     return
                 
-                # 检查是否有上一次上传/生成的图片
-                last_image_paths = self.last_images.get(conversation_key)
-                if not last_image_paths or not all(os.path.exists(image_path) for image_path in last_image_paths):
-                    reply_text = "未找到可编辑的图片，请先上传一张图片或使用生成图片命令"
-                    e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                
-                # 尝试编辑图片
+                # 添加try/finally确保命令被拦截
                 try:
+                    # 先尝试从缓存获取最近的图片
+                    image_data = self._get_recent_image(conversation_key)
+                    image_path = None
+                    
+                    if image_data:
+                        # 如果找到缓存的图片，保存到本地
+                        image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                        with open(image_path, "wb") as f:
+                            f.write(image_data)
+                        
+                        # 更新最后保存的图片路径
+                        self.last_images[conversation_key] = image_path
+                        logger.info(f"从缓存中找到图片数据，大小: {len(image_data)} 字节，保存到: {image_path}")
+                    
+                    # 如果从缓存找不到图片，检查最后保存的图片
+                    if not image_data:
+                        last_image_path = self.last_images.get(conversation_key)
+                        
+                        # 如果last_image_path是列表，取第一个有效路径
+                        if isinstance(last_image_path, list) and last_image_path:
+                            # 找到第一个存在的图片路径
+                            valid_path = None
+                            for path in last_image_path:
+                                if os.path.exists(path):
+                                    valid_path = path
+                                    break
+                            last_image_path = valid_path
+                            logger.info(f"从last_images列表中找到有效路径: {valid_path}")
+                        
+                        if last_image_path and os.path.exists(last_image_path):
+                            # 读取最后保存的图片
+                            with open(last_image_path, "rb") as f:
+                                image_data = f.read()
+                            image_path = last_image_path
+                            logger.info(f"从最后保存的图片路径读取图片数据: {last_image_path}")
+                        else:
+                            # 没有可用的图片
+                            reply = Reply(ReplyType.TEXT, "未找到可编辑的图片，请先上传一张图片或使用生成图片命令")
+                            e_context["channel"].send(reply, e_context["context"])
+                        e_context.action = EventAction.BREAK_PASS
+                        return
+                    
+                    # 已获取到图片数据，开始编辑
                     # 发送处理中消息
                     processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
                     e_context["channel"].send(processing_reply, e_context["context"])
                     
-                    # 读取上一次的图片
-                    image_datas = [open(image_path, "rb").read() for image_path in last_image_paths]
-                    
                     # 获取会话上下文
                     conversation_history = self.conversations[conversation_key]
                     
-                    # 修复clean_texts列表生成，确保不为空
-                    if text_responses and any(text is not None for text in text_responses):
-                        # 过滤掉None值
-                        valid_responses = [text for text in text_responses if text]
-                        if valid_responses:
-                            clean_texts = [text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_") for text in valid_responses]
-                            clean_texts = [text[:30] + "..." if len(text) > 30 else text for text in clean_texts]
-                        else:
-                            clean_texts = ["image_edited"]
-                    else:
-                        clean_texts = ["image_edited"]
-                    
                     # 编辑图片
-                    result_image_datas, text_responses = self._edit_image(prompt, image_datas, conversation_history)
+                    result_image, text_response = self._edit_image(prompt, image_data, conversation_history)
                     
-                    if result_image_datas:
+                    if result_image:
                         # 保存编辑后的图片
-                        edited_image_paths = []
-                        for i, result_image_data in enumerate(result_image_datas):
-                            if result_image_data is not None:  # 确保图片数据不为None
-                                clean_text = clean_texts[i] if i < len(clean_texts) else f"edited_{i}"
-                                edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}_{clean_text}.png")
-                                with open(edited_image_path, "wb") as f:
-                                    f.write(result_image_data)
-                                edited_image_paths.append(edited_image_path)
+                        reply_text = text_response if text_response else "图片编辑成功！"
                         
-                        # 更新最后生成的图片路径
-                        self.last_images[conversation_key] = edited_image_paths
+                        if not conversation_history or len(conversation_history) <= 2:  # 如果是新会话
+                            reply_text += f"（已开始图像对话，可以继续发送命令修改图片。需要结束时请发送\"{self.exit_commands[0]}\"）"
+                            
+                        # 将回复文本添加到文件名中
+                        clean_text = reply_text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_")
+                        clean_text = clean_text[:30] + "..." if len(clean_text) > 30 else clean_text
+                        
+                        edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}_{clean_text}.png")
+                        with open(edited_image_path, "wb") as f:
+                            f.write(result_image)
+                        
+                        # 更新最后生成的图片路径 - 对于编辑功能，保持单个路径更简单
+                        self.last_images[conversation_key] = edited_image_path
+                        logger.info(f"更新最后编辑的图片路径: {edited_image_path}")
                         
                         # 更新会话历史
-                        user_messages = [
-                            {"role": "user", "parts": [{"text": prompt}, {"image_url": image_path}]}
-                            for image_path in last_image_paths
-                        ]
-                        conversation_history.extend(user_messages)
+                        user_message = {
+                            "role": "user", 
+                            "parts": [
+                                {"text": prompt},
+                                {"image_url": image_path}
+                            ]
+                        }
+                        conversation_history.append(user_message)
                         
-                        assistant_messages = [
-                            {
-                                "role": "model", 
-                                "parts": [
-                                    {"text": text_response if text_response else "我已编辑完成图片"},
-                                    {"image_url": edited_image_path}
-                                ]
-                            }
-                            for text_response, edited_image_path in zip(text_responses, edited_image_paths)
-                        ]
-                        conversation_history.extend(assistant_messages)
+                        # 会话历史部分
+                        assistant_message = {
+                            "role": "model", 
+                            "parts": [
+                                {"text": text_response if text_response else "我已编辑了图片"},
+                                {"image_url": edited_image_path}
+                            ]
+                        }
+                        conversation_history.append(assistant_message)
                         
                         # 限制会话历史长度
                         if len(conversation_history) > 10:  # 保留最近5轮对话
@@ -459,221 +507,171 @@ class GeminiImage(Plugin):
                         self.conversation_timestamps[conversation_key] = time.time()
                         
                         # 先发送文本消息
-                        has_sent_text = False
-                        for i, (text_response, image_data) in enumerate(zip(text_responses, result_image_datas)):
-                            if text_response:  # 如果有文本，先发送文本
-                                e_context["channel"].send(Reply(ReplyType.TEXT, text_response), e_context["context"])
-                                has_sent_text = True  # 标记已发送文本
-                            
-                            if image_data:  # 如果有图片，再发送图片
-                                # 创建临时文件保存图片，每个图片都需要单独发送
-                                temp_image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}_{i}.png")
-                                with open(temp_image_path, "wb") as f:
-                                    f.write(image_data)
-                                
-                                # 单独发送每张图片
-                                image_file = open(temp_image_path, "rb")
-                                e_context["channel"].send(Reply(ReplyType.IMAGE, image_file), e_context["context"])
+                        cleaned_reply_text = reply_text.strip()
+                        e_context["channel"].send(Reply(ReplyType.TEXT, cleaned_reply_text), e_context["context"])
                         
-                        # 如果已经发送了文本，则不再重复发送
-                        if not has_sent_text:
-                            # 只有在没有发送过文本的情况下，才发送汇总文本
-                            if any(text is not None for text in text_responses):
-                                valid_responses = [text for text in text_responses if text]
-                                if valid_responses:
-                                    translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                                    reply_text = "\n".join([resp for resp in translated_responses if resp])
-                                    e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                            else:
-                                # 检查是否有文本响应，可能是内容被拒绝
-                                if text_responses and any(text is not None for text in text_responses):
-                                    # 过滤掉None值
-                                    valid_responses = [text for text in text_responses if text]
-                                    if valid_responses:
-                                        # 内容审核拒绝的情况，翻译并发送拒绝消息
-                                        translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                                        reply_text = "\n".join([resp for resp in translated_responses if resp])
-                                        e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                                    else:
-                                        e_context["channel"].send(Reply(ReplyType.TEXT, "图片编辑失败，请稍后再试或修改描述"), e_context["context"])
-                            # 确保只设置一次action
-                            e_context.action = EventAction.BREAK_PASS
-                        else:
-                            reply_text = "图片编辑失败，请稍后再试或修改描述"
-                            e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                            e_context.action = EventAction.BREAK_PASS
+                        # 再发送图片
+                        edited_image_file = open(edited_image_path, "rb")
+                        e_context["channel"].send(Reply(ReplyType.IMAGE, edited_image_file), e_context["context"])
+                        e_context.action = EventAction.BREAK_PASS
                     else:
                         # 检查是否有文本响应，可能是内容被拒绝
-                        if text_responses and any(text is not None for text in text_responses):
-                            # 过滤掉None值
-                            valid_responses = [text for text in text_responses if text]
-                            if valid_responses:
-                                # 内容审核拒绝的情况，翻译并发送拒绝消息
-                                translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                                reply_text = "\n".join([resp for resp in translated_responses if resp])
-                                e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
+                        if text_response:
+                            # 确保translated_response是字符串
+                            if isinstance(text_response, list):
+                                valid_texts = [t for t in text_response if t]
+                                if valid_texts:
+                                    translated_responses = [self._translate_gemini_message(t) for t in valid_texts]
+                                    translated_response = "\n".join(translated_responses)
+                                else:
+                                    translated_response = "图片编辑失败，请稍后再试或修改描述"
                             else:
-                                e_context["channel"].send(Reply(ReplyType.TEXT, "图片编辑失败，请稍后再试或修改描述"), e_context["context"])
+                                translated_response = self._translate_gemini_message(text_response)
+                            
+                            reply = Reply(ReplyType.TEXT, translated_response)
+                            e_context["channel"].send(reply, e_context["context"])
                             e_context.action = EventAction.BREAK_PASS
                         else:
-                            reply_text = "图片编辑失败，请稍后再试或修改描述"
-                            e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
+                            reply = Reply(ReplyType.TEXT, "图片编辑失败，请稍后再试或修改描述")
+                            e_context["channel"].send(reply, e_context["context"])
                             e_context.action = EventAction.BREAK_PASS
                 except Exception as e:
                     logger.error(f"编辑图片失败: {str(e)}")
                     logger.exception(e)
-                    reply_text = f"编辑图片失败: {str(e)}"
-                    e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                    # 确保在异常情况下也设置正确的action，防止命令继续传递
+                    reply = Reply(ReplyType.TEXT, f"编辑图片失败: {str(e)}")
+                    e_context["channel"].send(reply, e_context["context"])
+                finally:
+                    # 确保在任何情况下都设置action为BREAK_PASS
                     e_context.action = EventAction.BREAK_PASS
+                    logger.info("图片编辑命令已处理，设置action为BREAK_PASS")
                 return
 
         # 检查是否是对话继续（没有前缀命令，但有活跃会话）
         if conversation_key in self.conversations:
             # 有活跃会话，视为继续对话
             try:
-                # 检查是否有上一次生成的图片
-                last_image_paths = self.last_images.get(conversation_key)
-                if not last_image_paths or not all(os.path.exists(image_path) for image_path in last_image_paths):
-                    # 没有上一次图片，当作生成新图片处理
-                    reply_texts = ["未找到上一次生成的图片，请使用生成图片命令开始新的会话"]
-                    e_context["channel"].send(Reply(ReplyType.TEXT, reply_texts[0]), e_context["context"])
-                    e_context.action = EventAction.BREAK_PASS
-                    return
-                
-                # 发送处理中消息
-                processing_reply = Reply(ReplyType.TEXT, "正在处理您的请求，请稍候...")
-                e_context["channel"].send(processing_reply, e_context["context"])
-                
-                # 获取上下文历史
-                conversation_history = self.conversations[conversation_key]
-                
-                # 尝试编辑图片
-                image_datas = [open(image_path, "rb").read() for image_path in last_image_paths]
-                
-                # 编辑图片
-                result_image_datas, text_responses = self._edit_image(content, image_datas, conversation_history)
-                
-                if result_image_datas:
-                    # 初始化clean_texts变量
-                    if text_responses and any(text is not None for text in text_responses):
-                        # 过滤掉None值
-                        valid_responses = [text for text in text_responses if text]
-                        if valid_responses:
-                            clean_texts = [text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_") for text in valid_responses]
-                            clean_texts = [text[:30] + "..." if len(text) > 30 else text for text in clean_texts]
-                        else:
-                            clean_texts = ["edited_image"]  # 默认名称
-                    else:
-                        clean_texts = ["edited_image"]  # 默认名称
+                # 添加try/finally确保命令被拦截
+                try:
+                    # 检查是否有上一次生成的图片
+                    last_image_path = self.last_images.get(conversation_key)
                     
-                    # 保存编辑后的图片
-                    edited_image_paths = []
-                    for i, result_image_data in enumerate(result_image_datas):
-                        if result_image_data is not None:  # 确保图片数据不为None
-                            clean_text = clean_texts[i] if i < len(clean_texts) else f"edited_{i}"
-                            edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}_{clean_text}.png")
-                            with open(edited_image_path, "wb") as f:
-                                f.write(result_image_data)
-                            edited_image_paths.append(edited_image_path)
+                    # 如果last_image_path是列表，取第一个有效路径
+                    if isinstance(last_image_path, list) and last_image_path:
+                        # 找到第一个存在的图片路径
+                        valid_path = None
+                        for path in last_image_path:
+                            if os.path.exists(path):
+                                valid_path = path
+                                break
+                        last_image_path = valid_path
                     
-                    # 更新最后生成的图片路径
-                    self.last_images[conversation_key] = edited_image_paths
+                    if not last_image_path or not os.path.exists(last_image_path):
+                        # 没有上一次图片，当作生成新图片处理
+                        reply = Reply(ReplyType.TEXT, "未找到上一次生成的图片，请使用生成图片命令开始新的会话")
+                        e_context["channel"].send(reply, e_context["context"])
+                        e_context.action = EventAction.BREAK_PASS
+                        return
                     
-                    # 更新会话历史
-                    user_messages = [
-                        {"role": "user", "parts": [{"text": content}, {"image_url": image_path}]}
-                        for image_path in last_image_paths
-                    ]
-                    conversation_history.extend(user_messages)
+                    # 发送处理中消息
+                    processing_reply = Reply(ReplyType.TEXT, "正在处理您的请求，请稍候...")
+                    e_context["channel"].send(processing_reply, e_context["context"])
                     
-                    assistant_messages = [
-                        {
+                    # 获取上下文历史
+                    conversation_history = self.conversations[conversation_key]
+                    
+                    # 尝试编辑图片
+                    with open(last_image_path, "rb") as f:
+                        image_data = f.read()
+                    
+                    # 编辑图片
+                    result_image, text_response = self._edit_image(content, image_data, conversation_history)
+                    
+                    if result_image:
+                        # 保存编辑后的图片
+                        reply_text = text_response if text_response else "图片修改成功！"
+                        
+                        # 将回复文本添加到文件名中
+                        clean_text = reply_text.replace("/", "_").replace("\\", "_").replace(":", "_").replace("*", "_")
+                        clean_text = clean_text[:30] + "..." if len(clean_text) > 30 else clean_text
+                        
+                        new_image_path = os.path.join(self.save_dir, f"gemini_{int(time.time())}_{uuid.uuid4().hex[:8]}_{clean_text}.png")
+                        with open(new_image_path, "wb") as f:
+                            f.write(result_image)
+                        
+                        # 更新最后生成的图片路径 - 对于编辑功能，保持单个路径更简单
+                        self.last_images[conversation_key] = new_image_path
+                        logger.info(f"更新最后编辑的图片路径: {new_image_path}")
+                        
+                        # 更新会话历史
+                        user_message = {
+                            "role": "user", 
+                            "parts": [
+                                {"text": content},
+                                {"image_url": last_image_path}
+                            ]
+                        }
+                        conversation_history.append(user_message)
+                        
+                        # 会话历史部分
+                        assistant_message = {
                             "role": "model", 
                             "parts": [
                                 {"text": text_response if text_response else "我已编辑了图片"},
-                                {"image_url": edited_image_path}
+                                {"image_url": new_image_path}
                             ]
                         }
-                        for text_response, edited_image_path in zip(text_responses, edited_image_paths)
-                    ]
-                    conversation_history.extend(assistant_messages)
-                    
-                    # 限制会话历史长度
-                    if len(conversation_history) > 10:
-                        conversation_history = conversation_history[-10:]
-                    
-                    # 更新会话时间戳
-                    self.conversation_timestamps[conversation_key] = time.time()
-                    
-                    # 先发送文本消息
-                    has_sent_text = False
-                    for i, (text_response, image_data) in enumerate(zip(text_responses, image_datas)):
-                        if text_response:  # 如果有文本，先发送文本
-                            e_context["channel"].send(Reply(ReplyType.TEXT, text_response), e_context["context"])
-                            has_sent_text = True  # 标记已发送文本
+                        conversation_history.append(assistant_message)
                         
-                        if image_data:  # 如果有图片，再发送图片
-                            # 创建临时文件保存图片，每个图片都需要单独发送
-                            temp_image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}_{i}.png")
-                            with open(temp_image_path, "wb") as f:
-                                f.write(image_data)
-                            
-                            # 单独发送每张图片
-                            image_file = open(temp_image_path, "rb")
-                            e_context["channel"].send(Reply(ReplyType.IMAGE, image_file), e_context["context"])
-                    
-                    # 如果已经发送了文本，则不再重复发送
-                    if not has_sent_text:
-                        # 只有在没有发送过文本的情况下，才发送汇总文本
-                        if any(text is not None for text in text_responses):
-                            valid_responses = [text for text in text_responses if text]
-                            if valid_responses:
-                                translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                                reply_text = "\n".join([resp for resp in translated_responses if resp])
-                                e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                            else:
-                                # 检查是否有文本响应，可能是内容被拒绝
-                                if text_responses and any(text is not None for text in text_responses):
-                                    # 过滤掉None值
-                                    valid_responses = [text for text in text_responses if text]
-                                    if valid_responses:
-                                        # 内容审核拒绝的情况，翻译并发送拒绝消息
-                                        translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                                        reply_text = "\n".join([resp for resp in translated_responses if resp])
-                                        e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                                    else:
-                                        e_context["channel"].send(Reply(ReplyType.TEXT, "图片修改失败，请稍后再试或修改描述"), e_context["context"])
-                                # 确保只设置一次action
-                                e_context.action = EventAction.BREAK_PASS
-                        else:
-                            reply_texts = ["图片修改失败，请稍后再试或修改描述"]
-                            e_context["channel"].send(Reply(ReplyType.TEXT, reply_texts[0]), e_context["context"])
-                            e_context.action = EventAction.BREAK_PASS
-                    e_context.action = EventAction.BREAK_PASS
-                else:
-                    # 检查是否有文本响应，可能是内容被拒绝
-                    if text_responses and any(text is not None for text in text_responses):
-                        # 过滤掉None值
-                        valid_responses = [text for text in text_responses if text]
-                        if valid_responses:
-                            # 内容审核拒绝的情况，翻译并发送拒绝消息
-                            translated_responses = [self._translate_gemini_message(text) for text in valid_responses]
-                            reply_text = "\n".join([resp for resp in translated_responses if resp])
-                            e_context["channel"].send(Reply(ReplyType.TEXT, reply_text), e_context["context"])
-                        else:
-                            e_context["channel"].send(Reply(ReplyType.TEXT, "图片修改失败，请稍后再试或修改描述"), e_context["context"])
+                        # 限制会话历史长度
+                        if len(conversation_history) > 10:
+                            conversation_history = conversation_history[-10:]
+                        
+                        # 更新会话时间戳
+                        self.conversation_timestamps[conversation_key] = time.time()
+                        
+                        # 先发送文本消息
+                        cleaned_reply_text = reply_text.strip()
+                        e_context["channel"].send(Reply(ReplyType.TEXT, cleaned_reply_text), e_context["context"])
+                        
+                        # 再发送图片
+                        new_image_file = open(new_image_path, "rb")
+                        e_context["channel"].send(Reply(ReplyType.IMAGE, new_image_file), e_context["context"])
                         e_context.action = EventAction.BREAK_PASS
                     else:
-                        reply_texts = ["图片修改失败，请稍后再试或修改描述"]
-                        e_context["channel"].send(Reply(ReplyType.TEXT, reply_texts[0]), e_context["context"])
-                        e_context.action = EventAction.BREAK_PASS
+                        # 检查是否有文本响应，可能是内容被拒绝
+                        if text_response:
+                            # 确保translated_response是字符串
+                            if isinstance(text_response, list):
+                                valid_texts = [t for t in text_response if t]
+                                if valid_texts:
+                                    translated_responses = [self._translate_gemini_message(t) for t in valid_texts]
+                                    translated_response = "\n".join(translated_responses)
+                                else:
+                                    translated_response = "图片修改失败，请稍后再试或修改描述"
+                            else:
+                                translated_response = self._translate_gemini_message(text_response)
+                            
+                            reply = Reply(ReplyType.TEXT, translated_response)
+                            e_context["channel"].send(reply, e_context["context"])
+                            e_context.action = EventAction.BREAK_PASS
+                        else:
+                            reply = Reply(ReplyType.TEXT, "图片修改失败，请稍后再试或修改描述")
+                            e_context["channel"].send(reply, e_context["context"])
+                            e_context.action = EventAction.BREAK_PASS
+                except Exception as e:
+                    logger.error(f"对话继续生成图片失败: {str(e)}")
+                    logger.exception(e)
+                    reply = Reply(ReplyType.TEXT, f"处理失败: {str(e)}")
+                    e_context["channel"].send(reply, e_context["context"])
+                finally:
+                    # 确保在任何情况下都设置action为BREAK_PASS
+                    e_context.action = EventAction.BREAK_PASS
+                    logger.info("对话继续命令已处理，设置action为BREAK_PASS")
             except Exception as e:
-                logger.error(f"对话继续生成图片失败: {str(e)}")
+                logger.error(f"处理对话继续时出错: {str(e)}")
                 logger.exception(e)
-                reply_texts = [f"处理失败: {str(e)}"]
-                e_context["channel"].send(Reply(ReplyType.TEXT, reply_texts[0]), e_context["context"])
-                # 确保在异常情况下也设置正确的action，防止命令继续传递
+                reply = Reply(ReplyType.TEXT, f"处理失败: {str(e)}")
+                e_context["channel"].send(reply, e_context["context"])
                 e_context.action = EventAction.BREAK_PASS
             return
     
@@ -738,23 +736,48 @@ class GeminiImage(Plugin):
             
             # 尝试从content获取文件路径并读取文件
             if hasattr(context, 'content') and context.content:
-                file_paths = context.content
-                # 尝试将相对路径转换为绝对路径
-                if not os.path.isabs(file_paths):
-                    abs_paths = [os.path.abspath(file_path) for file_path in file_paths]
-                    logger.info(f"转换为绝对路径: {abs_paths}")
-                    if all(os.path.exists(abs_path) for abs_path in abs_paths):
-                        file_paths = abs_paths
+                # 确保file_paths是列表形式
+                if isinstance(context.content, list):
+                    file_paths = context.content
+                else:
+                    # 如果是单个字符串，转换为单元素列表
+                    file_paths = [context.content]
                 
                 logger.info(f"从content获取到文件路径: {file_paths}")
-                if all(os.path.exists(file_path) for file_path in file_paths):
-                    try:
-                        image_datas = [open(file_path, 'rb').read() for file_path in file_paths]
-                        logger.info(f"从文件路径读取到图片数据，大小: {sum(len(image_data) for image_data in image_datas)} 字节")
-                    except Exception as e:
-                        logger.error(f"读取图片文件失败: {e}")
-                else:
-                    logger.warning(f"文件路径不存在: {file_paths}")
+                
+                # 尝试将相对路径转换为绝对路径
+                abs_paths = []
+                for file_path in file_paths:
+                    if not os.path.isabs(file_path):
+                        abs_path = os.path.abspath(file_path)
+                        if os.path.exists(abs_path):
+                            abs_paths.append(abs_path)
+                        else:
+                            abs_paths.append(file_path)  # 保留原路径
+                    else:
+                        abs_paths.append(file_path)
+                
+                # 只有当所有路径都可以转为绝对路径时才替换
+                if len(abs_paths) == len(file_paths):
+                    file_paths = abs_paths
+                    logger.info(f"转换为绝对路径: {abs_paths}")
+                
+                # 读取所有有效文件
+                image_datas = []
+                for file_path in file_paths:
+                    if os.path.exists(file_path):
+                        try:
+                            with open(file_path, 'rb') as f:
+                                image_datas.append(f.read())
+                            logger.info(f"从文件路径读取到图片数据，大小: {len(image_datas[-1])} 字节")
+                        except Exception as e:
+                            logger.error(f"读取图片文件失败: {e}")
+                    else:
+                        logger.warning(f"文件路径不存在: {file_path}")
+                
+                # 如果读取到了至少一个图片，使用它们
+                if image_datas:
+                    logger.info(f"从文件路径读取到 {len(image_datas)} 个图片")
             
             # 尝试从msg对象获取图片数据
             if not image_datas and 'msg' in context.kwargs:
@@ -836,28 +859,29 @@ class GeminiImage(Plugin):
             logger.error(f"处理图片消息失败: {str(e)}")
             logger.exception(e)
     
-    def _get_recent_image(self, conversation_key: str) -> Optional[List[bytes]]:
+    def _get_recent_image(self, conversation_key: str) -> Optional[bytes]:
         """获取最近的图片数据，支持群聊和单聊场景
         
         Args:
             conversation_key: 会话标识，可能是session_id或用户ID
             
         Returns:
-            Optional[List[bytes]]: 图片数据列表或None。如果找到单个图片，会包装为列表返回。
+            Optional[bytes]: 图片数据或None
         """
         # 尝试从conversation_key直接获取缓存
         cache_data = self.image_cache.get(conversation_key)
         if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
             content = cache_data["content"]
-            # 确保返回的是列表格式
-            if isinstance(content, bytes):
-                content = [content]
-            elif not isinstance(content, list):
+            # 确保返回的是单个bytes对象而不是列表
+            if isinstance(content, list) and len(content) > 0:
+                logger.info(f"从缓存获取到图片数据列表，使用第一个元素，大小: {len(content[0])} 字节，缓存键: {conversation_key}")
+                return content[0]
+            elif isinstance(content, bytes):
+                logger.info(f"从缓存获取到图片数据，大小: {len(content)} 字节，缓存键: {conversation_key}")
+                return content
+            else:
                 logger.warning(f"缓存中的图片数据格式不正确: {type(content)}")
                 return None
-            
-            logger.info(f"从缓存获取到图片数据，数量: {len(content)}，缓存键: {conversation_key}")
-            return content
         
         # 群聊场景：尝试使用当前消息上下文中的发送者ID
         context = e_context['context'] if 'e_context' in locals() else None
@@ -888,15 +912,16 @@ class GeminiImage(Plugin):
                     cache_data = self.image_cache.get(group_key)
                     if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                         content = cache_data["content"]
-                        # 确保返回的是列表格式
-                        if isinstance(content, bytes):
-                            content = [content]
-                        elif not isinstance(content, list):
-                            logger.warning(f"缓存中的图片数据格式不正确: {type(content)}")
+                        # 确保返回的是单个bytes对象而不是列表
+                        if isinstance(content, list) and len(content) > 0:
+                            logger.info(f"从群聊缓存键获取到图片数据列表，使用第一个元素，大小: {len(content[0])} 字节，缓存键: {group_key}")
+                            return content[0]
+                        elif isinstance(content, bytes):
+                            logger.info(f"从群聊缓存键获取到图片数据，大小: {len(content)} 字节，缓存键: {group_key}")
+                            return content
+                        else:
+                            logger.warning(f"群聊缓存中的图片数据格式不正确: {type(content)}")
                             return None
-                        
-                        logger.info(f"从群聊缓存键获取到图片数据，数量: {len(content)}，缓存键: {group_key}")
-                        return content
         
         # 遍历所有缓存键，查找匹配的键
         for cache_key in self.image_cache:
@@ -904,15 +929,16 @@ class GeminiImage(Plugin):
                 cache_data = self.image_cache.get(cache_key)
                 if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                     content = cache_data["content"]
-                    # 确保返回的是列表格式
-                    if isinstance(content, bytes):
-                        content = [content]
-                    elif not isinstance(content, list):
-                        logger.warning(f"缓存中的图片数据格式不正确: {type(content)}")
-                        continue
-                    
-                    logger.info(f"从组合缓存键获取到图片数据，数量: {len(content)}，缓存键: {cache_key}")
-                    return content
+                    # 确保返回的是单个bytes对象而不是列表
+                    if isinstance(content, list) and len(content) > 0:
+                        logger.info(f"从组合缓存键获取到图片数据列表，使用第一个元素，大小: {len(content[0])} 字节，缓存键: {cache_key}")
+                        return content[0]
+                    elif isinstance(content, bytes):
+                        logger.info(f"从组合缓存键获取到图片数据，大小: {len(content)} 字节，缓存键: {cache_key}")
+                        return content
+                    else:
+                        logger.warning(f"组合缓存中的图片数据格式不正确: {type(content)}")
+                        return None
             
         # 如果没有找到，尝试其他方法
         if '_' in conversation_key:
@@ -922,15 +948,16 @@ class GeminiImage(Plugin):
                 cache_data = self.image_cache.get(part)
                 if cache_data and time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                     content = cache_data["content"]
-                    # 确保返回的是列表格式
-                    if isinstance(content, bytes):
-                        content = [content]
-                    elif not isinstance(content, list):
-                        logger.warning(f"缓存中的图片数据格式不正确: {type(content)}")
-                        continue
-                    
-                    logger.info(f"从拆分键部分获取到图片数据，数量: {len(content)}，缓存键: {part}")
-                    return content
+                    # 确保返回的是单个bytes对象而不是列表
+                    if isinstance(content, list) and len(content) > 0:
+                        logger.info(f"从拆分键部分获取到图片数据列表，使用第一个元素，大小: {len(content[0])} 字节，缓存键: {part}")
+                        return content[0]
+                    elif isinstance(content, bytes):
+                        logger.info(f"从拆分键部分获取到图片数据，大小: {len(content)} 字节，缓存键: {part}")
+                        return content
+                    else:
+                        logger.warning(f"拆分键部分的图片数据格式不正确: {type(content)}")
+                        return None
                 
         return None
     
@@ -1148,28 +1175,55 @@ class GeminiImage(Plugin):
                                 image_datas.append(img_data)
                                 text_responses.append(None)  # 对应位置添加None表示没有文本
                     
+                    # 检查是否有图片数据
                     if not image_datas or all(img is None for img in image_datas):
                         logger.error(f"API响应中没有找到图片数据: {result}")
                         # 检查是否有文本响应，仅返回文本数据
                         if text_responses and any(text is not None for text in text_responses):
-                            # 仅返回文本响应，不修改e_context
-                            return [], text_responses  # 返回空图片列表和文本
+                            # 过滤出有效的文本响应
+                            valid_texts = [text for text in text_responses if text]
+                            return [], valid_texts  # 返回空图片列表和有效文本列表
                         return [], []
                     
-                    return image_datas, text_responses
+                    # 返回完整的图片和文本列表，而不是只取第一个
+                    valid_images = [img for img in image_datas if img]
+                    valid_texts = [text for text in text_responses if text]
+                    
+                    # 确保两个列表的长度一致，便于迭代处理
+                    # 如果图片比文本多，为文本列表添加None元素
+                    # 如果文本比图片多，保留所有文本，不需要为图片添加None元素
+                    max_length = max(len(valid_images), len(valid_texts))
+                    if len(valid_images) < max_length:
+                        valid_images.extend([None] * (max_length - len(valid_images)))
+                    if len(valid_texts) < max_length:
+                        valid_texts.extend([None] * (max_length - len(valid_texts)))
+                        
+                    return valid_images, valid_texts
                 
                 logger.error(f"未找到生成的图片数据: {result}")
                 return [], []
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
                 return [], []
+        except requests.exceptions.SSLError as e:
+            logger.error(f"API调用SSL错误: {str(e)}")
+            logger.exception(e)
+            return [], [f"图片生成失败: SSL连接错误，请检查网络或代理设置: {str(e)}"]
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"API调用连接错误: {str(e)}")
+            logger.exception(e)
+            return [], [f"图片生成失败: 连接错误，请检查网络或代理设置: {str(e)}"]
+        except requests.exceptions.Timeout as e:
+            logger.error(f"API调用超时: {str(e)}")
+            logger.exception(e)
+            return [], [f"图片生成失败: API调用超时，请稍后再试: {str(e)}"]
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
-            return [], []
+            return [], [f"图片生成失败: {str(e)}"]
     
-    def _edit_image(self, prompt: str, image_data_input: Union[bytes, List[bytes]], conversation_history: List[Dict] = None) -> Tuple[List[Optional[bytes]], List[Optional[str]]]:
-        """调用Gemini API编辑图片，返回图片数据列表和文本响应列表，以支持图文混排内容
+    def _edit_image(self, prompt: str, image_data_input: Union[bytes, List[bytes]], conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
+        """调用Gemini API编辑图片，返回处理后的图片数据和文本响应
         
         Args:
             prompt: 编辑图片的文本提示
@@ -1177,8 +1231,8 @@ class GeminiImage(Plugin):
             conversation_history: 会话历史记录
             
         返回值:
-            Tuple[List[Optional[bytes]], List[Optional[str]]]: 图片数据列表和文本响应列表，
-            按照API返回的顺序排列，以支持图文混排内容的处理。
+            Tuple[Optional[bytes], Optional[str]]: 编辑后的图片数据和文本响应。
+            如果API返回了多个结果，会选择第一个有效的图片和文本。
         """
         url = f"{self.base_url}/v1beta/models/gemini-2.0-flash-exp-image-generation:generateContent"
         headers = {
@@ -1198,7 +1252,7 @@ class GeminiImage(Plugin):
         # 验证图片数据
         if not image_datas or len(image_datas) == 0:
             logger.error("没有提供图片数据")
-            return [], []
+            return None, None
         
         # 将图片数据转换为Base64编码
         image_base64 = base64.b64encode(image_datas[0]).decode("utf-8")  # 使用第一张图片
@@ -1313,7 +1367,7 @@ class GeminiImage(Plugin):
                     finish_reason = candidates[0].get("finishReason", "")
                     if finish_reason == "IMAGE_SAFETY":
                         logger.warning("Gemini API返回IMAGE_SAFETY，图片内容可能违反安全政策")
-                        return [], [json.dumps(result)]  # 返回整个响应作为错误信息
+                        return None, json.dumps(result)  # 返回整个响应作为错误信息
                     
                     content = candidates[0].get("content", {})
                     parts = content.get("parts", [])
@@ -1341,24 +1395,44 @@ class GeminiImage(Plugin):
                         logger.error(f"API响应中没有找到图片数据: {result}")
                         # 检查是否有文本响应，仅返回文本数据
                         if text_responses and any(text is not None for text in text_responses):
-                            # 仅返回文本响应，不修改e_context
-                            return [], text_responses  # 返回空图片列表和文本
-                        return [], []
+                            # 获取第一个有效的文本响应
+                            valid_text = next((t for t in text_responses if t), None)
+                            return None, valid_text  # 返回None表示没有图片, 和第一个有效文本
+                        return None, None
                     
-                    return image_datas, text_responses
+                    # 获取第一个有效的图片和文本
+                    first_valid_image = next((img for img in image_datas if img), None)
+                    first_valid_text = next((text for text in text_responses if text), None)
+                    
+                    return first_valid_image, first_valid_text
                 
                 logger.error(f"未找到编辑后的图片数据: {result}")
-                return [], []
+                return None, None
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return [], []
+                return None, None
+        except requests.exceptions.SSLError as e:
+            logger.error(f"API调用SSL错误: {str(e)}")
+            logger.exception(e)
+            return None, f"图片编辑失败: SSL连接错误，请检查网络或代理设置: {str(e)}"
+        except requests.exceptions.ConnectionError as e:
+            logger.error(f"API调用连接错误: {str(e)}")
+            logger.exception(e)
+            return None, f"图片编辑失败: 连接错误，请检查网络或代理设置: {str(e)}"
+        except requests.exceptions.Timeout as e:
+            logger.error(f"API调用超时: {str(e)}")
+            logger.exception(e)
+            return None, f"图片编辑失败: API调用超时，请稍后再试: {str(e)}"
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
-            return [], []
+            return None, f"图片编辑失败: {str(e)}"
     
     def _translate_gemini_message(self, text: str) -> str:
         """将Gemini API的英文消息翻译成中文"""
+        if not text:
+            return ""
+            
         # 内容安全过滤消息
         if "finishReason" in text and "IMAGE_SAFETY" in text:
             return "抱歉，您的请求可能违反了内容安全政策，无法生成或编辑图片。请尝试修改您的描述，提供更为安全、合规的内容。"
@@ -1385,7 +1459,7 @@ class GeminiImage(Plugin):
         if "against our content policy" in text:
             return "抱歉，您的请求违反了内容政策，无法生成相关图片。请提供其他描述。"
         
-        # 默认情况，原样返回
+        # 保留原始文本格式
         return text
     
     def _load_config_template(self):
