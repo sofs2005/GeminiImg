@@ -47,6 +47,10 @@ class GeminiImage(Plugin):
         "image_analysis_commands": ["g分析图片", "g识图"],
         "follow_up_commands": ["g追问"],
         "exit_commands": ["g结束对话", "g结束"],
+        "print_model_commands": ["g打印对话模型", "g打印模型"],
+        "switch_model_commands": ["g切换对话模型", "g切换模型"],
+        "chat_commands": ["g对话"],
+        "expand_commands": ["g扩写"],
         "enable_points": False,
         "generate_image_cost": 10,
         "edit_image_cost": 15,
@@ -59,7 +63,7 @@ class GeminiImage(Plugin):
         "translate_api_base": "https://open.bigmodel.cn/api/paas/v4",
         "translate_api_key": "",
         "translate_model": "glm-4-flash",
-        "enable_translate": True,
+        "enable_translate": False,
         "translate_on_commands": ["g开启翻译", "g启用翻译"],
         "translate_off_commands": ["g关闭翻译", "g禁用翻译"],
         "reverse_prompt": ""
@@ -83,7 +87,15 @@ class GeminiImage(Plugin):
             self.api_key = self.config.get("gemini_api_key", "")
             
             # 模型配置
-            self.model = self.config.get("model", "gemini-2.0-flash-exp-image-generation")
+            self.image_model = self.config.get("image_model", "gemini-2.0-flash-exp-image-generation")
+            self.chat_model = self.config.get("chat_model", "gemini-2.0-flash-thinking-exp-01-21")
+            # 可用模型列表
+            self.chat_model_list = self.config.get("chat_model_list", [
+                "gemini-2.0-flash-thinking-exp-01-21",
+                "gemini-2.0-flash",
+                "gemini-2.0-flash-lite",
+                "gemini-2.5-pro-preview-03-25"
+            ])
 
             # 获取baseurl配置
             self.base_url = self.config.get("base_url", "https://generativelanguage.googleapis.com")
@@ -97,6 +109,10 @@ class GeminiImage(Plugin):
             self.image_analysis_commands = self.config.get("image_analysis_commands", ["g分析图片", "g识图"])
             self.follow_up_commands = self.config.get("follow_up_commands", ["g追问"])
             self.exit_commands = self.config.get("exit_commands", ["g结束对话", "g结束"])
+            self.expand_commands = self.config.get("expand_commands", ["g扩写"])
+            self.chat_commands = self.config.get("chat_commands", ["g对话", "g回答"])
+            self.print_model_commands = self.config.get("print_model_commands", ["g打印对话模型", "g打印模型"])
+            self.switch_model_commands = self.config.get("switch_model_commands", ["g切换对话模型", "g切换模型"])
             
             # 获取积分配置
             self.enable_points = self.config.get("enable_points", False)
@@ -128,6 +144,10 @@ class GeminiImage(Plugin):
             # 获取翻译控制命令配置
             self.translate_on_commands = self.config.get("translate_on_commands", ["g开启翻译", "g启用翻译"])
             self.translate_off_commands = self.config.get("translate_off_commands", ["g关闭翻译", "g禁用翻译"])
+            
+            # 获取提示词扩写配置
+            self.expand_prompt = self.config.get("expand_prompt", "请帮我扩写以下提示词，使其更加详细和具体：{prompt}")
+            self.expand_model = self.config.get("expand_model", "gemini-2.0-flash-thinking-exp-01-21")
             
             # 用户翻译设置缓存，用于存储每个用户的翻译设置
             self.user_translate_settings = {}  # 用户ID -> 是否启用翻译
@@ -172,11 +192,7 @@ class GeminiImage(Plugin):
             
             # 绑定事件处理函数
             self.handlers[Event.ON_HANDLE_CONTEXT] = self.on_handle_context
-
-            # 设置定期清理标志和最后清理时间
-            self._last_cleanup_time = time.time()
-            self._start_cleanup_thread()            
-
+          
             logger.info("GeminiImage插件初始化成功")
             if self.enable_proxy:
                 logger.info(f"GeminiImage插件已启用代理: {self.proxy_url}")
@@ -186,40 +202,6 @@ class GeminiImage(Plugin):
             logger.exception(e)
             self.enable = False
 
-    def _start_cleanup_thread(self):
-        """启动一个后台线程用于定期清理"""
-        import threading
-        
-        # 定义清理函数
-        def cleanup_worker():
-            while True:
-                try:
-                    # 获取当前时间
-                    current_time = time.time()
-                    current_hour = time.localtime(current_time).tm_hour
-                    
-                    # 晚上2点到4点之间执行清理
-                    is_night_time = 2 <= current_hour <= 4
-                    time_since_last_cleanup = current_time - self._last_cleanup_time
-                    
-                    # 如果是夜间或者距离上次清理已经超过24小时，执行清理
-                    if is_night_time or time_since_last_cleanup > 24 * 3600:
-                        logger.info("执行定期清理临时文件")
-                        self._cleanup_temp_files()
-                        self._last_cleanup_time = current_time
-                
-                # 异常处理，确保线程不会因为错误而终止
-                except Exception as e:
-                    logger.error(f"清理线程发生错误: {str(e)}")
-                
-                # 每小时检查一次
-                time.sleep(3600)
-        
-        # 创建并启动后台线程
-        cleanup_thread = threading.Thread(target=cleanup_worker, daemon=True)
-        cleanup_thread.start()
-        logger.info("临时文件清理线程已启动")
-    
     def on_handle_context(self, e_context: EventContext):
         """处理消息事件"""
         if not self.enable:
@@ -239,12 +221,6 @@ class GeminiImage(Plugin):
         # 检查是否是深夜时段（凌晨2-4点之间）
         current_hour = time.localtime(current_time).tm_hour
         is_night_time = 2 <= current_hour <= 4
-        
-        # 如果是深夜时段，且距离上次清理已超过6小时，执行清理
-        if is_night_time and (current_time - self._last_cleanup_time) > 6 * 3600:
-            logger.info("执行夜间定时清理临时文件")
-            self._cleanup_temp_files()
-            self._last_cleanup_time = current_time
 
         # 获取用户ID
         user_id = context.get("from_user_id")
@@ -280,6 +256,70 @@ class GeminiImage(Plugin):
             return
         
         content = context.content.strip()
+        
+        # 检查是否是打印模型命令
+        for cmd in self.print_model_commands:
+            if content == cmd:
+                # 构建模型列表文本
+                models_text = "Gemini可用对话模型：\n"
+                for i, model in enumerate(self.chat_model_list, 1):
+                    prefix = "👉" if model == self.chat_model else ""
+                    models_text += f"{prefix}{i}. {model}\n"
+                
+                models_text += "\n请输入命令和模型序号，例如：g切换对话模型 3"
+                reply = Reply(ReplyType.TEXT, models_text)
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
+        
+        # 检查是否是切换模型命令
+        for cmd in self.switch_model_commands:
+            if content.startswith(cmd):
+                # 提取模型序号
+                parts = content.split()
+                if len(parts) < 2:
+                    # 只输入了切换模型命令，没有指定模型序号
+                    models_text = "Gemini可用对话模型：\n"
+                    for i, model in enumerate(self.chat_model_list, 1):
+                        prefix = "👉" if model == self.chat_model else ""
+                        models_text += f"{prefix}{i}. {model}\n"
+                    
+                    models_text += "\n请输入命令和模型序号，例如：g切换对话模型 3"
+                    reply = Reply(ReplyType.TEXT, models_text)
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                else:
+                    # 尝试解析模型序号
+                    try:
+                        model_index = int(parts[1]) - 1  # 用户输入的是从1开始的序号
+                        
+                        if 0 <= model_index < len(self.chat_model_list):
+                            # 有效的模型序号
+                            new_model = self.chat_model_list[model_index]
+                            self.chat_model = new_model
+                            self.config["model"] = new_model
+                            
+                            # 更新配置文件
+                            config_path = os.path.join(os.path.dirname(__file__), "config.json")
+                            if os.path.exists(config_path):
+                                with open(config_path, 'r', encoding='utf-8') as file:
+                                    config_data = json.load(file)
+                                    config_data["model"] = new_model
+                                    with open(config_path, 'w', encoding='utf-8') as file:
+                                        json.dump(config_data, file, ensure_ascii=False, indent=2)
+                            
+                            reply = Reply(ReplyType.TEXT, f"已切换对话模型: {new_model}")
+                        else:
+                            # 无效的模型序号
+                            reply = Reply(ReplyType.TEXT, f"无效的模型序号：{model_index + 1}，可用序号范围：1-{len(self.chat_model_list)}")
+                    except ValueError:
+                        # 无法解析为整数
+                        reply = Reply(ReplyType.TEXT, "请输入有效的模型序号，例如：g切换对话模型 3")
+                
+                e_context["reply"] = reply
+                e_context.action = EventAction.BREAK_PASS
+                return
         
         # 检查是否是反推提示词命令
         for cmd in self.image_reverse_commands:
@@ -356,6 +396,118 @@ class GeminiImage(Plugin):
                 e_context.action = EventAction.BREAK_PASS
                 return
         
+        # 检查是否是提示词扩写命令
+        for cmd in self.expand_commands:
+            if content.startswith(cmd):
+                # 提取提示词
+                prompt = content[len(cmd):].strip()
+                if not prompt:
+                    reply = Reply(ReplyType.TEXT, f"请提供需要扩写的提示词，格式：{cmd} [提示词]")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                # 检查API密钥是否配置
+                if not self.api_key:
+                    reply = Reply(ReplyType.TEXT, "请先在配置文件中设置Gemini API密钥")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                try:
+                    # 发送处理中消息
+                    processing_reply = Reply(ReplyType.TEXT, f"正在使用{self.expand_model}扩写提示词...")
+                    e_context["channel"].send(processing_reply, e_context["context"])
+                    
+                    # 调用API进行提示词扩写
+                    response = self._expand_prompt(prompt)
+                    
+                    if response:
+                        # 添加用户提示到会话
+                        user_message = {"role": "user", "parts": [{"text": prompt}]}
+                        # 发送回复
+                        reply = Reply(ReplyType.TEXT, response)
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                    else:
+                        reply = Reply(ReplyType.TEXT, "提示词扩写失败，请稍后重试")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                except Exception as e:
+                    logger.error(f"处理提示词扩写请求失败: {str(e)}")
+                    logger.exception(e)
+                    reply = Reply(ReplyType.TEXT, f"处理提示词扩写请求失败: {str(e)}")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                return
+                
+        # 检查是否是对话命令
+        for cmd in self.chat_commands:
+            if content.startswith(cmd):
+                # 提取提示词
+                prompt = content[len(cmd):].strip()
+                if not prompt:
+                    reply = Reply(ReplyType.TEXT, f"请提供对话内容，格式：{cmd} [内容]")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                # 检查API密钥是否配置
+                if not self.api_key:
+                    reply = Reply(ReplyType.TEXT, "请先在配置文件中设置Gemini API密钥")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                    return
+                
+                try:
+                    # 发送处理中消息
+                    processing_reply = Reply(ReplyType.TEXT, f"正在调用{self.chat_model}回答您的问题...")
+                    e_context["channel"].send(processing_reply, e_context["context"])
+                    
+                    # 获取会话历史
+                    conversation_history = self.conversations[conversation_key]
+                    
+                    # 翻译提示词
+                    translated_prompt = self._translate_prompt(prompt, user_id)
+                    
+                    # 调用API进行对话
+                    response = self._chat_with_gemini(translated_prompt, conversation_history)
+                    
+                    if response:
+                        # 添加用户提示到会话
+                        user_message = {"role": "user", "parts": [{"text": prompt}]}
+                        conversation_history.append(user_message)
+                        
+                        # 添加助手回复到会话
+                        assistant_message = {
+                            "role": "model", 
+                            "parts": [{"text": response}]
+                        }
+                        conversation_history.append(assistant_message)
+                        
+                        # 限制会话历史长度
+                        if len(conversation_history) > 10:  # 保留最近5轮对话
+                            conversation_history = conversation_history[-10:]
+                        
+                        # 更新会话时间戳
+                        self.conversation_timestamps[conversation_key] = time.time()
+                        
+                        # 发送回复
+                        reply = Reply(ReplyType.TEXT, response)
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                    else:
+                        reply = Reply(ReplyType.TEXT, "对话失败，请稍后重试")
+                        e_context["reply"] = reply
+                        e_context.action = EventAction.BREAK_PASS
+                except Exception as e:
+                    logger.error(f"处理对话请求失败: {str(e)}")
+                    logger.exception(e)
+                    reply = Reply(ReplyType.TEXT, f"处理对话请求失败: {str(e)}")
+                    e_context["reply"] = reply
+                    e_context.action = EventAction.BREAK_PASS
+                return
+
         # 检查是否是翻译控制命令
         for cmd in self.translate_on_commands:
             if content == cmd:
@@ -487,7 +639,7 @@ class GeminiImage(Plugin):
                 # 尝试生成图片
                 try:
                     # 发送处理中消息
-                    processing_reply = Reply(ReplyType.TEXT, "正在生成图片，请稍候...")
+                    processing_reply = Reply(ReplyType.TEXT, "正在调用gemini生成图片，请稍候...")
                     e_context["channel"].send(processing_reply, e_context["context"])
                     
                     # 获取上下文历史
@@ -734,7 +886,10 @@ class GeminiImage(Plugin):
                     # 没有找到缓存的图片，检查是否有最后生成的图片
                     if conversation_key in self.last_images:
                         last_image_path = self.last_images[conversation_key]
-                        if os.path.exists(last_image_path):
+                        # 确保last_image_path是字符串类型
+                        if isinstance(last_image_path, list):
+                            last_image_path = last_image_path[0] if last_image_path else None
+                        if last_image_path and os.path.exists(last_image_path):
                             try:
                                 # 发送处理中消息
                                 processing_reply = Reply(ReplyType.TEXT, "正在编辑图片，请稍候...")
@@ -868,7 +1023,7 @@ class GeminiImage(Plugin):
                 logger.info(f"用户 {user_id} 开始等待上传参考图片，提示词: {prompt}")
                 
                 # 发送提示消息
-                reply = Reply(ReplyType.TEXT, "请发送需要编辑的参考图片")
+                reply = Reply(ReplyType.TEXT, "请发送需要gemini编辑的参考图片")
                 e_context["reply"] = reply
                 e_context.action = EventAction.BREAK_PASS
                 return
@@ -1128,12 +1283,12 @@ class GeminiImage(Plugin):
             if key in self.last_images:
                 del self.last_images[key]
     
-    def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
-        """调用Gemini API生成图片，返回图片数据和文本响应"""
+    def _chat_with_gemini(self, prompt: str, conversation_history: List[Dict] = None) -> Optional[str]:
+        """调用Gemini API进行纯文本对话，返回文本响应"""
         # 根据配置决定使用直接调用还是通过代理服务调用
         if self.use_proxy_service and self.proxy_service_url:
             # 使用代理服务调用API
-            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.chat_model}:generateContent"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
@@ -1141,7 +1296,154 @@ class GeminiImage(Plugin):
             params = {}  # 不需要在URL参数中传递API密钥
         else:
             # 直接调用Google API
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.chat_model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            params = {
+                "key": self.api_key
+            }
+        
+        # 构建请求数据
+        if conversation_history and len(conversation_history) > 0:
+            # 有会话历史，构建上下文
+            data = {
+                "contents": conversation_history + [{"role": "user", "parts": [{"text": prompt}]}]
+            }
+        else:
+            # 无会话历史，直接发送提示词
+            data = {
+                "contents": [{"role": "user", "parts": [{"text": prompt}]}]
+            }
+        
+        try:
+            # 发送请求
+            proxies = None
+            # 只有在直接调用Google API且启用了代理时才使用代理
+            if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+                proxies = {
+                    "http": self.proxy_url,
+                    "https": self.proxy_url
+                }
+                response = requests.post(url, headers=headers, params=params, json=data, proxies=proxies)
+            else:
+                response = requests.post(url, headers=headers, params=params, json=data)
+            
+            # 检查响应状态码
+            if response.status_code == 200:
+                # 解析响应数据
+                result = response.json()
+                if "candidates" in result and len(result["candidates"]) > 0:
+                    candidate = result["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        parts = candidate["content"]["parts"]
+                        if len(parts) > 0 and "text" in parts[0]:
+                            return parts[0]["text"]
+                return None
+            else:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"调用Gemini API异常: {str(e)}")
+            logger.exception(e)
+            return None
+
+    def _expand_prompt(self, prompt: str) -> Optional[str]:
+        """扩写提示词
+        
+        Args:
+            prompt: 原始提示词
+            
+        Returns:
+            扩写后的提示词
+        """
+        # 如果提示词为空，直接返回
+        if not prompt or len(prompt.strip()) == 0:
+            return prompt
+            
+        # 获取系统提示词模板和模型
+        expand_model = self.config.get("expand_model", "gemini-2.0-flash-thinking-exp-01-21")
+        system_prompt = self.config.get("expand_prompt", "请帮我扩写以下提示词，使其更加详细和具体：{prompt}").format(prompt=prompt)
+        
+        # 根据配置决定使用直接调用还是通过代理服务调用
+        if self.use_proxy_service and self.proxy_service_url:
+            # 使用代理服务调用API
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{expand_model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
+            }
+            params = {}  # 不需要在URL参数中传递API密钥
+        else:
+            # 直接调用Google API
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{expand_model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+            }
+            params = {
+                "key": self.api_key
+            }
+        
+        # 构建请求数据
+        data = {
+            "contents": [
+                {                    
+                    "role": "model",
+                    "parts": [{"text": system_prompt}]
+                },
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}]
+                }
+            ]
+        }
+        
+        try:
+            # 发送请求
+            proxies = None
+            # 只有在直接调用Google API且启用了代理时才使用代理
+            if self.enable_proxy and self.proxy_url and not self.use_proxy_service:
+                proxies = {
+                    "http": self.proxy_url,
+                    "https": self.proxy_url
+                }
+                response = requests.post(url, headers=headers, params=params, json=data, proxies=proxies)
+            else:
+                response = requests.post(url, headers=headers, params=params, json=data)
+            
+            # 检查响应状态码
+            if response.status_code == 200:
+                # 解析响应数据
+                result = response.json()
+                if "candidates" in result and len(result["candidates"]) > 0:
+                    candidate = result["candidates"][0]
+                    if "content" in candidate and "parts" in candidate["content"]:
+                        parts = candidate["content"]["parts"]
+                        if len(parts) > 0 and "text" in parts[0]:
+                            return parts[0]["text"]
+                return None
+            else:
+                logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
+                return None
+        except Exception as e:
+            logger.error(f"调用Gemini API异常: {str(e)}")
+            logger.exception(e)
+            return None
+
+    def _generate_image(self, prompt: str, conversation_history: List[Dict] = None) -> Tuple[Optional[bytes], Optional[str]]:
+        """调用Gemini API生成图片，返回图片数据和文本响应"""
+        # 根据配置决定使用直接调用还是通过代理服务调用
+        if self.use_proxy_service and self.proxy_service_url:
+            # 使用代理服务调用API
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
+            headers = {
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
+            }
+            params = {}  # 不需要在URL参数中传递API密钥
+        else:
+            # 直接调用Google API
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
             headers = {
                 "Content-Type": "application/json",
             }
@@ -1309,7 +1611,7 @@ class GeminiImage(Plugin):
                 return None, "API调用失败，请稍后再试或检查代理服务配置"
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, "API调用失败，请检查网络连接或代理服务配置"
+                return None, "API调用失败，请检查网络连接或代理服务配置".replace('\n', '').replace('\r', '')
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
@@ -1320,7 +1622,7 @@ class GeminiImage(Plugin):
         # 根据配置决定使用直接调用还是通过代理服务调用
         if self.use_proxy_service and self.proxy_service_url:
             # 使用代理服务调用API
-            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+            url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
             headers = {
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
@@ -1328,7 +1630,7 @@ class GeminiImage(Plugin):
             params = {}  # 不需要在URL参数中传递API密钥
         else:
             # 直接调用Google API
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
             headers = {
                 "Content-Type": "application/json",
             }
@@ -1508,7 +1810,7 @@ class GeminiImage(Plugin):
                 return None, "API调用失败，请稍后再试或检查代理服务配置"
             else:
                 logger.error(f"Gemini API调用失败 (状态码: {response.status_code}): {response.text}")
-                return None, "API调用失败，请检查网络连接或代理服务配置"
+                return None, "API调用失败，请检查网络连接或代理服务配置".replace('\n', '').replace('\r', '')
         except Exception as e:
             logger.error(f"API调用异常: {str(e)}")
             logger.exception(e)
@@ -1857,14 +2159,14 @@ class GeminiImage(Plugin):
             
             # 根据配置决定使用直接调用还是通过代理服务调用
             if self.use_proxy_service and self.proxy_service_url:
-                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
                 }
                 params = {}
             else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                 }
@@ -1951,14 +2253,14 @@ class GeminiImage(Plugin):
             
             # 根据配置决定使用直接调用还是通过代理服务调用
             if self.use_proxy_service and self.proxy_service_url:
-                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.model}:generateContent"
+                url = f"{self.proxy_service_url.rstrip('/')}/v1beta/models/{self.image_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                     "Authorization": f"Bearer {self.api_key}"  # 使用Bearer认证方式
                 }
                 params = {}
             else:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model}:generateContent"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.image_model}:generateContent"
                 headers = {
                     "Content-Type": "application/json",
                 }
@@ -2155,10 +2457,12 @@ class GeminiImage(Plugin):
         help_text += f"3. 参考图编辑：发送 {self.reference_edit_commands[0]} + 描述，然后上传图片\n"
         help_text += f"4. 融图：发送 {self.merge_commands[0]} + 描述，然后按顺序上传两张图片\n"
         help_text += f"5. 识图：发送 {self.image_analysis_commands[0]} 然后上传图片，或发送问题后上传图片\n"
-        help_text += f"6. 反推提示：发送 {self.image_reverse_commands[0]} 然后上传图片，分析图片特征\n"
+        help_text += f"6. 反推提示：发送 {self.image_reverse_commands[0]} 然后上传图片，可分析图片内容并反推提示词\n"
         help_text += f"7. 追问：发送 {self.follow_up_commands[0]} + 问题，对已识别的图片进行追加提问\n"
-        help_text += f"8. 继续对话：直接发送描述，例如：把帽子换成红色的\n"
-        help_text += f"9. 结束对话：发送 {self.exit_commands[0]}\n\n"
+        help_text += f"8. 结束对话：发送 {self.exit_commands[0]}\n"
+        help_text += f"9. 提示增强：发送 {self.exand_commands[0]} + 绘画提示，可对提示词进行智能扩写\n"
+        help_text += f"10. 文本对话：发送 {self.chat_commands[0]} + 问题，可直接进行文本对话\n"
+        help_text += f"11. 模型管理：发送 {self.print_model_commands[0]} 查看可用对话模型，发送 {self.switch_model_commands[0]} 切换对话模型\n\n"
         
         if self.enable_translate:
             help_text += "特色功能：\n"
