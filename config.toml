@@ -1,0 +1,70 @@
+[GeminiImage]
+# 基本配置
+# 版本号: 2.0.0
+enable = true
+# 支持多个Gemini API密钥，使用数组格式
+gemini_api_keys = [""]  # 可以添加多个密钥，例如 ["key1", "key2", "key3"]
+model = "gemini-2.0-flash-exp-image-generation"  # 使用的模型名称
+base_url = ""
+
+# 命令配置
+commands = ["#生成图片", "#画图", "#图片生成", "g画"]  # 生成图片的命令
+edit_commands = ["#编辑图片", "#修改图片", "g改"]      # 编辑图片的命令
+exit_commands = ["#结束对话", "#退出对话", "#关闭对话", "#结束", "g结束"]  # 结束对话的命令
+
+# 新增命令配置
+merge_commands = ["#融图", "#合成图片", "g合"]  # 融合图片的命令
+start_merge_commands = ["#开始融合", "#生成融图", "g开始"]  # 开始融合的命令
+image_reverse_commands = ["#反推提示", "#反推", "g反推"]  # 反向提示词命令
+prompt_enhance_commands = ["#提示词", "#生成提示词", "g提示词"]  # 提示词增强命令
+image_analysis_commands = ["#分析图片", "#图片分析", "g分析"]  # 图片分析命令
+
+# 积分系统配置
+enable_points = true     # 是否启用积分系统
+show_points_message = true  # 是否显示积分相关消息
+generate_image_cost = 0  # 生成图片消耗的积分
+edit_image_cost = 0      # 编辑图片消耗的积分
+merge_image_cost = 0     # 融合图片消耗的积分
+reverse_image_cost = 0   # 反向提示词消耗的积分
+
+# 图片保存配置
+save_path = "temp"        # 临时保存生成图片的路径
+
+# 超级用户设置，可免费使用
+admins = []               # 管理员列表
+
+# 代理配置
+enable_proxy = false
+proxy_url = "http://127.0.0.1:7890"  # 代理地址，格式如：http://127.0.0.1:7890 或 socks5://127.0.0.1:1080
+
+# 群聊中继续对话的唤醒词
+wake_words = ["#生成图片", "#画图", "#图片生成", "#编辑图片", "#修改图片", "#继续", "#图片", "#修改", "#融图", "#合成图片", "#反推提示", "#反推", "#提示词", "#生成提示词"]
+
+# 机器人名称配置（用于检测@消息）
+robot_names = ["bot", "胖猫", "机器人"]
+
+# 提示词增强相关配置
+enhance_prompt = true  # 是否启用提示词增强
+prompt_model = "gemini-2.0-flash"  # 用于增强提示词的模型
+reverse_model = "gemini-2.0-flash"  # 用于反推提示词的模型
+analysis_model = "gemini-2.0-flash"  # 用于图片分析的模型
+
+# 图片融合相关配置
+max_merge_images = 5  # 最大融合图片数量
+merge_image_wait_timeout = 180  # 等待融图图片的超时时间(秒)
+
+# 反向提示词生成相关配置
+reverse_image_wait_timeout = 180  # 等待反推图片的超时时间(秒)
+
+# 图片分析相关配置
+analysis_image_wait_timeout = 180  # 等待分析图片的超时时间(秒)
+analysis_image_cost = 5  # 图片分析消耗的积分
+
+# 对话前缀配置
+conversation_prefixes = ["@绘图", "@图片", "@Gemini", "ge"]  # 连续对话模式的前缀
+require_prefix_for_conversation = true  # 是否要求连续对话使用前缀
+
+# 重试机制相关配置
+max_retries = 3  # 最大重试次数
+initial_retry_delay = 1  # 初始重试延迟（秒）
+max_retry_delay = 10  # 最大重试延迟（秒）
