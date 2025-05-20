@@ -4,7 +4,7 @@
 enable = true
 # 支持多个Gemini API密钥，使用数组格式
 gemini_api_keys = [""]  # 可以添加多个密钥，例如 ["key1", "key2", "key3"]
-model = "gemini-2.0-flash-exp-image-generation"  # 使用的模型名称
+model = "gemini-2.0-flash-preview-image-generation"  # 使用的模型名称
 base_url = ""
 
 # 命令配置
@@ -20,8 +20,8 @@ prompt_enhance_commands = ["#提示词", "#生成提示词", "g提示词"]  # �
 image_analysis_commands = ["#分析图片", "#图片分析", "g分析"]  # 图片分析命令
 
 # 积分系统配置
-enable_points = true     # 是否启用积分系统
-show_points_message = true  # 是否显示积分相关消息
+enable_points = false     # 是否启用积分系统
+show_points_message = false  # 是否显示积分相关消息
 generate_image_cost = 0  # 生成图片消耗的积分
 edit_image_cost = 0      # 编辑图片消耗的积分
 merge_image_cost = 0     # 融合图片消耗的积分
@@ -45,9 +45,10 @@ robot_names = ["bot", "胖猫", "机器人"]
 
 # 提示词增强相关配置
 enhance_prompt = true  # 是否启用提示词增强
-prompt_model = "gemini-2.0-flash"  # 用于增强提示词的模型
-reverse_model = "gemini-2.0-flash"  # 用于反推提示词的模型
-analysis_model = "gemini-2.0-flash"  # 用于图片分析的模型
+prompt_model = "gemini-2.5-flash-preview-04-17"  # 用于增强提示词的模型
+reverse_model = "gemini-2.5-flash-preview-04-17"  # 用于反推提示词的模型
+analysis_model = "gemini-2.5-flash-preview-04-17"  # 用于图片分析的模型
+show_prompt_with_image = false  # 是否在生成图片时同时输出提示词
 
 # 图片融合相关配置
 max_merge_images = 5  # 最大融合图片数量

@@ -24,7 +24,7 @@ from loguru import logger
 # 框架导入
 from WechatAPI import WechatAPIClient
 from database.XYBotDB import XYBotDB
-from utils.decorators import on_text_message, on_image_message, on_file_message, add_job_safe, schedule
+from utils.decorators import on_text_message, on_image_message, on_file_message, on_quote_message, add_job_safe, schedule
 from utils.plugin_base import PluginBase
 
 # 导入增强的系统提示词
@@ -104,6 +104,7 @@ class GeminiImage(PluginBase):
             self.image_analysis_commands = plugin_config.get("image_analysis_commands", ["#分析图片", "#图片分析", "g分析"])
 
             # 记录命令配置
+            logger.info(f"GeminiImage插件编辑图片命令配置: {self.edit_commands}")
             logger.info(f"GeminiImage插件融图命令配置: {self.merge_commands}")
             logger.info(f"GeminiImage插件开始融合命令配置: {self.start_merge_commands}")
             logger.info(f"GeminiImage插件反向提示词命令配置: {self.image_reverse_commands}")
@@ -192,6 +193,12 @@ class GeminiImage(PluginBase):
             self.waiting_for_analyze_image_query = {}  # 用户ID -> 分析图片时的具体问题
             self.analyze_image_wait_timeout = plugin_config.get("analyze_image_wait_timeout", 180)
 
+            # 编辑图片相关状态变量
+            self.waiting_for_edit_image = {}  # 用户ID -> 是否等待编辑图片
+            self.waiting_for_edit_image_time = {}  # 用户ID -> 开始等待编辑图片的时间戳
+            self.waiting_for_edit_image_prompt = {}  # 用户ID -> 编辑图片时的提示词
+            self.edit_image_wait_timeout = plugin_config.get("edit_image_wait_timeout", 180)
+
             # 保存配置对象，供其他方法使用
             self.config = plugin_config
 
@@ -211,11 +218,676 @@ class GeminiImage(PluginBase):
             logger.error(traceback.format_exc())
             self.enable = False
 
-    @on_text_message(priority=30)
+    @on_quote_message(priority=200)
+    async def handle_quote(self, bot: WechatAPIClient, message: dict) -> bool:
+        """处理引用消息"""
+        # 添加更详细的日志，记录完整的消息内容
+        logger.info(f"GeminiImage.handle_quote被调用，消息: {message}")
+
+        if not self.enable:
+            logger.info("GeminiImage插件未启用，跳过处理")
+            return True  # 插件未启用，继续执行后续插件
+
+        content = message.get("Content", "").strip()
+        logger.info(f"GeminiImage收到引用消息: {content}")
+        logger.info(f"当前反向提示词命令配置: {self.image_reverse_commands}")
+
+        # 检查是否是反向提示词命令
+        is_reverse_command = False
+        for cmd in self.image_reverse_commands:
+            logger.info(f"检查命令 '{cmd}' 是否匹配内容 '{content}'")
+            if content.startswith(cmd):
+                is_reverse_command = True
+                logger.info(f"匹配成功！命令 '{cmd}' 匹配内容 '{content}'")
+                break
+
+        # 检查是否是图片分析命令
+        is_analyze_command = False
+        if not is_reverse_command:
+            for cmd in self.image_analysis_commands:
+                if content.startswith(cmd):
+                    is_analyze_command = True
+                    break
+
+        # 检查是否是编辑图片命令
+        is_edit_command = False
+        if not is_reverse_command and not is_analyze_command:
+            for cmd in self.edit_commands:
+                if content.startswith(cmd):
+                    is_edit_command = True
+                    break
+
+        # 如果不是我们处理的命令，允许其他插件处理
+        if not is_reverse_command and not is_analyze_command and not is_edit_command:
+            logger.info(f"引用消息不是GeminiImage处理的命令，允许其他插件处理: {content}")
+            return True
+
+        # 获取引用的消息
+        reference_message = message.get("Quote", {})
+        if not reference_message:
+            logger.warning(f"引用消息中没有Quote字段: {message}")
+            return True  # 没有引用消息，允许其他插件处理
+
+        # 如果引用的不是图片消息，允许其他插件处理
+        if reference_message.get("MsgType") != 3:  # 图片消息类型
+            logger.info(f"引用的不是图片消息，允许其他插件处理: {reference_message.get('MsgType')}")
+            return True
+
+        # 获取会话信息
+        from_wxid = message.get("FromWxid", "")
+        sender_wxid = message.get("SenderWxid", "")
+        conversation_key = f"{from_wxid}_{sender_wxid}"
+
+        # 尝试从引用消息中获取MD5
+        ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+        logger.info(f"从引用消息中提取的MD5: {ref_md5}")
+        if not ref_md5 and "Content" in reference_message:
+            # 尝试从Content中提取MD5
+            ref_content = reference_message.get("Content", "")
+            md5_match = re.search(r'md5="([^"]+)"', ref_content)
+            if md5_match:
+                ref_md5 = md5_match.group(1)
+                logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+        if not ref_md5:
+            logger.warning(f"无法从引用消息中提取MD5: {reference_message}")
+            return True  # 没有MD5，允许其他插件处理
+
+        # 尝试在/app/files/目录下查找图片
+        app_file_path = None
+        for ext in ['.jpeg', '.png', '.jpg']:
+            temp_path = f"/app/files/{ref_md5}{ext}"
+            if os.path.exists(temp_path):
+                app_file_path = temp_path
+                logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                break
+
+        if not app_file_path:
+            logger.warning(f"未找到MD5为 {ref_md5} 的图片文件")
+            return True  # 没有找到图片，允许其他插件处理
+
+        # 直接使用系统缓存的图片路径
+        self.last_images[conversation_key] = app_file_path
+        logger.info(f"成功保存引用图片的系统缓存路径: {app_file_path}")
+
+        # 处理反向提示词命令
+        if is_reverse_command:
+            logger.info(f"处理引用图片的反向提示词命令: {content}")
+
+            # 检查积分
+            if self.enable_points and sender_wxid not in self.admins:
+                points = self.db.get_points(sender_wxid)
+                if points < self.reverse_cost:
+                    await bot.send_at_message(from_wxid, f"\n您的积分不足，反向提示词需要{self.reverse_cost}积分，您当前有{points}积分", [sender_wxid])
+                    return False  # 积分不足，阻止后续插件执行
+
+            try:
+                # 发送处理中消息
+                await bot.send_at_message(from_wxid, "\n正在分析图片，生成提示词，请稍候...", [sender_wxid])
+
+                # 读取图片
+                with open(app_file_path, "rb") as f:
+                    image_data = f.read()
+
+                # 扣除积分
+                if self.enable_points and sender_wxid not in self.admins:
+                    self.db.add_points(sender_wxid, -self.reverse_cost)
+                    points_after = self.db.get_points(sender_wxid)
+
+                    # 如果启用了积分消息显示，发送积分消息
+                    if self.show_points_message:
+                        points_msg = f"已扣除{self.reverse_cost}积分，当前剩余{points_after}积分"
+                        await bot.send_text_message(from_wxid, points_msg)
+                        # 添加短暂延迟
+                        await asyncio.sleep(0.5)
+
+                # 调用反向提示词API
+                logger.info(f"引用图片反向提示词，调用_reverse_image")
+                prompt = await self._reverse_image(image_data)
+
+                if prompt:
+                    # 发送提示词
+                    await bot.send_text_message(from_wxid, f"图片提示词：\n{prompt}")
+                else:
+                    await bot.send_at_message(from_wxid, "\n无法生成提示词，请稍后再试", [sender_wxid])
+            except Exception as e:
+                logger.error(f"反向提示词失败: {str(e)}")
+                logger.error(traceback.format_exc())
+                await bot.send_at_message(from_wxid, f"\n反向提示词失败: {str(e)}", [sender_wxid])
+            return False  # 已处理命令，阻止后续插件执行
+
+        # 处理图片分析命令
+        elif is_analyze_command:
+            logger.info(f"处理引用图片的分析命令: {content}")
+
+            # 提取用户的分析问题（如果有）
+            cmd_length = 0
+            for cmd in self.image_analysis_commands:
+                if content.startswith(cmd):
+                    cmd_length = len(cmd)
+                    break
+            user_query = content[cmd_length:].strip()
+
+            # 检查积分
+            if self.enable_points and sender_wxid not in self.admins:
+                points = self.db.get_points(sender_wxid)
+                if points < self.analysis_cost:
+                    await bot.send_at_message(from_wxid, f"\n您的积分不足，图片分析需要{self.analysis_cost}积分，您当前有{points}积分", [sender_wxid])
+                    return False  # 积分不足，阻止后续插件执行
+
+            try:
+                # 发送处理中消息
+                if user_query:
+                    await bot.send_at_message(from_wxid, f"\n正在分析图片，特别关注：{user_query}，请稍候...", [sender_wxid])
+                else:
+                    await bot.send_at_message(from_wxid, "\n正在分析图片，请稍候...", [sender_wxid])
+
+                # 读取图片
+                with open(app_file_path, "rb") as f:
+                    image_data = f.read()
+
+                # 扣除积分
+                if self.enable_points and sender_wxid not in self.admins:
+                    self.db.add_points(sender_wxid, -self.analysis_cost)
+                    points_after = self.db.get_points(sender_wxid)
+
+                    # 如果启用了积分消息显示，发送积分消息
+                    if self.show_points_message:
+                        points_msg = f"已扣除{self.analysis_cost}积分，当前剩余{points_after}积分"
+                        await bot.send_text_message(from_wxid, points_msg)
+                        # 添加短暂延迟
+                        await asyncio.sleep(0.5)
+
+                # 调用图片分析API
+                logger.info(f"引用图片分析，使用用户查询: '{user_query}'")
+                analysis_result = await self._analyze_image(image_data, user_query)
+
+                if analysis_result:
+                    # 发送分析结果
+                    await bot.send_text_message(from_wxid, analysis_result)
+                else:
+                    await bot.send_at_message(from_wxid, "\n无法分析图片，请稍后再试", [sender_wxid])
+            except Exception as e:
+                logger.error(f"图片分析失败: {str(e)}")
+                logger.error(traceback.format_exc())
+                await bot.send_at_message(from_wxid, f"\n图片分析失败: {str(e)}", [sender_wxid])
+            return False  # 已处理命令，阻止后续插件执行
+
+        # 处理编辑图片命令
+        elif is_edit_command:
+            logger.info(f"处理引用图片的编辑命令: {content}")
+
+            # 提取提示词
+            cmd_length = 0
+            for cmd in self.edit_commands:
+                if content.startswith(cmd):
+                    cmd_length = len(cmd)
+                    break
+            prompt = content[cmd_length:].strip()
+
+            if not prompt:
+                await bot.send_at_message(from_wxid, f"\n请提供编辑描述，格式：[命令] [描述]", [sender_wxid])
+                return False  # 命令格式错误，阻止后续插件执行
+
+            try:
+                # 发送处理中消息
+                await bot.send_at_message(from_wxid, "\n正在编辑图片，请稍候...", [sender_wxid])
+
+                # 读取图片
+                with open(app_file_path, "rb") as f:
+                    image_data = f.read()
+
+                # 获取会话上下文
+                conversation_history = self.conversations.get(conversation_key, [])
+
+                # 调用Gemini API编辑图片
+                logger.info(f"引用图片编辑，使用提示词: '{prompt}'")
+                edited_images, text_responses = await self._edit_image(prompt, image_data, conversation_history)
+
+                # 确保 edited_images 和 text_responses 不为 None
+                if edited_images is None:
+                    edited_images = []
+                if text_responses is None:
+                    text_responses = []
+
+                if len(edited_images) > 0 and edited_images[0]:
+                    # 保存编辑后的图片
+                    edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                    logger.info(f"保存编辑后的图片到: {edited_image_path}, 数据大小: {len(edited_images[0])} 字节")
+                    with open(edited_image_path, "wb") as f:
+                        f.write(edited_images[0])
+
+                    # 更新最后生成的图片路径
+                    self.last_images[conversation_key] = edited_image_path
+
+                    # 发送文本回复（如果有）
+                    first_valid_text = next((t for t in text_responses if t), None)
+                    if first_valid_text:
+                        # 清理文本，去除多余的空格和换行
+                        cleaned_text = first_valid_text.strip()
+                        # 将多个连续空格替换为单个空格
+                        cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+                        # 移除文本开头和结尾的引号
+                        if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
+                            cleaned_text = cleaned_text[1:-1]
+                        await bot.send_text_message(from_wxid, cleaned_text)
+                    else:
+                        await bot.send_text_message(from_wxid, "图片编辑成功！")
+                    # 添加短暂延迟，确保文本发送完成
+                    await asyncio.sleep(0.5)
+
+                    # 发送图片
+                    logger.info(f"准备发送编辑后的图片: {edited_image_path}")
+                    with open(edited_image_path, "rb") as f:
+                        await bot.send_image_message(from_wxid, f.read())
+                    # 添加延迟，确保图片发送完成
+                    await asyncio.sleep(1.5)
+
+                    # 更新会话历史
+                    user_message = {
+                        "role": "user",
+                        "parts": [
+                            {"text": prompt},
+                            {"image_url": app_file_path}
+                        ]
+                    }
+                    conversation_history.append(user_message)
+
+                    assistant_message = {
+                        "role": "model",
+                        "parts": [
+                            {"text": first_valid_text if first_valid_text else "我已编辑完成图片"},
+                            {"image_url": edited_image_path}
+                        ]
+                    }
+                    conversation_history.append(assistant_message)
+
+                    # 更新会话历史
+                    self.conversations[conversation_key] = conversation_history
+
+                    # 更新会话时间戳
+                    self.conversation_timestamps[conversation_key] = time.time()
+                else:
+                    # 检查是否有文本响应，可能是内容被拒绝
+                    first_valid_text = next((t for t in text_responses if t), None)
+                    if first_valid_text:
+                        # 内容审核拒绝的情况，翻译并转发拒绝消息给用户
+                        translated_response = self._translate_gemini_message(first_valid_text)
+                        await bot.send_at_message(from_wxid, f"\n{translated_response}", [sender_wxid])
+                        logger.warning(f"API拒绝编辑图片，提示: {first_valid_text}")
+                    else:
+                        logger.error(f"编辑图片失败，未获取到有效的图片数据")
+                        await bot.send_at_message(from_wxid, "\n图片编辑失败，请稍后再试或修改描述", [sender_wxid])
+            except Exception as e:
+                logger.error(f"编辑图片失败: {str(e)}")
+                logger.error(traceback.format_exc())
+                await bot.send_at_message(from_wxid, f"\n编辑图片失败: {str(e)}", [sender_wxid])
+            return False  # 已处理命令，阻止后续插件执行
+
+        # 如果走到这里，说明是我们处理的命令，但处理失败了，允许其他插件处理
+        return True
+
+    @on_text_message(priority=200)
     async def handle_generate_image(self, bot: WechatAPIClient, message: dict) -> bool:
         """处理生成图片的命令"""
         if not self.enable:
             return True  # 插件未启用，继续执行后续插件
+
+        # 记录收到的消息详情，帮助调试
+        content = message.get("Content", "").strip()
+        logger.info(f"GeminiImage收到文本消息: {content}")
+        logger.info(f"当前编辑命令列表: {self.edit_commands}")
+
+        # 检查是否是引用消息
+        reference_id = message.get("ReferenceId", "")
+        if reference_id:
+            logger.info(f"检测到引用消息，引用ID: {reference_id}")
+            logger.info(f"引用消息内容: {message.get('Quote', {})}")
+
+            # 特殊处理引用消息中的命令
+            is_edit_command = False
+            is_reverse_command = False
+            is_analyze_command = False
+            used_command = ""
+
+            # 检查是否是编辑图片命令
+            for cmd in self.edit_commands:
+                if content.startswith(cmd):
+                    is_edit_command = True
+                    used_command = cmd
+                    break
+
+            # 检查是否是反向提示词命令
+            if not is_edit_command:
+                for cmd in self.image_reverse_commands:
+                    if content.startswith(cmd):
+                        is_reverse_command = True
+                        used_command = cmd
+                        break
+
+            # 检查是否是图片分析命令
+            if not is_edit_command and not is_reverse_command:
+                for cmd in self.image_analysis_commands:
+                    if content.startswith(cmd):
+                        is_analyze_command = True
+                        used_command = cmd
+                        break
+
+            if is_edit_command:
+                logger.info(f"检测到引用图片的编辑命令: {content}，使用的命令: {used_command}")
+
+                # 获取会话信息
+                from_wxid = message.get("FromWxid", "")
+                sender_wxid = message.get("SenderWxid", "")
+                conversation_key = f"{from_wxid}_{sender_wxid}"
+
+                # 提取提示词
+                prompt = content[len(used_command):].strip()
+                if not prompt:
+                    await bot.send_at_message(from_wxid, f"\n请提供编辑描述，格式：{used_command} [描述]", [sender_wxid])
+                    return False  # 命令格式错误，阻止后续插件执行
+
+                # 尝试从引用消息中获取图片
+                reference_message = message.get("Quote", {})
+                if reference_message:
+                    logger.info(f"成功获取引用消息: {reference_message}")
+
+                    # 如果引用的是图片消息，处理引用的图片
+                    if reference_message.get("MsgType") == 3:  # 图片消息类型
+                        logger.info(f"引用的是图片消息，将处理引用的图片")
+
+                        # 尝试从引用消息中获取MD5
+                        ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                        if not ref_md5 and "Content" in reference_message:
+                            # 尝试从Content中提取MD5
+                            ref_content = reference_message.get("Content", "")
+                            md5_match = re.search(r'md5="([^"]+)"', ref_content)
+                            if md5_match:
+                                ref_md5 = md5_match.group(1)
+                                logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                        if ref_md5:
+                            # 尝试在/app/files/目录下查找图片
+                            app_file_path = f"/app/files/{ref_md5}.jpeg"
+                            if os.path.exists(app_file_path):
+                                logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+
+                                # 直接使用系统缓存的图片路径
+                                self.last_images[conversation_key] = app_file_path
+                                logger.info(f"成功保存引用图片的系统缓存路径: {app_file_path}")
+
+                                # 编辑图片
+                                try:
+                                    # 发送处理中消息
+                                    await bot.send_at_message(from_wxid, "\n正在编辑图片，请稍候...", [sender_wxid])
+
+                                    # 读取图片
+                                    with open(app_file_path, "rb") as f:
+                                        image_data = f.read()
+
+                                    # 获取会话上下文
+                                    conversation_history = self.conversations.get(conversation_key, [])
+
+                                    # 调用Gemini API编辑图片
+                                    edited_images, text_responses = await self._edit_image(prompt, image_data, conversation_history)
+
+                                    # 确保 edited_images 和 text_responses 不为 None
+                                    if edited_images is None:
+                                        edited_images = []
+                                    if text_responses is None:
+                                        text_responses = []
+
+                                    if len(edited_images) > 0 and edited_images[0]:
+                                        # 保存编辑后的图片
+                                        edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                                        logger.info(f"保存编辑后的图片到: {edited_image_path}, 数据大小: {len(edited_images[0])} 字节")
+                                        with open(edited_image_path, "wb") as f:
+                                            f.write(edited_images[0])
+
+                                        # 更新最后生成的图片路径
+                                        self.last_images[conversation_key] = edited_image_path
+
+                                        # 发送文本回复（如果有）
+                                        first_valid_text = next((t for t in text_responses if t), None)
+                                        if first_valid_text:
+                                            # 清理文本，去除多余的空格和换行
+                                            cleaned_text = first_valid_text.strip()
+                                            # 将多个连续空格替换为单个空格
+                                            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+                                            # 移除文本开头和结尾的引号
+                                            if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
+                                                cleaned_text = cleaned_text[1:-1]
+                                            await bot.send_text_message(from_wxid, cleaned_text)
+                                        else:
+                                            await bot.send_text_message(from_wxid, "图片编辑成功！")
+                                        # 添加短暂延迟，确保文本发送完成
+                                        await asyncio.sleep(0.5)
+
+                                        # 发送图片
+                                        logger.info(f"准备发送编辑后的图片: {edited_image_path}")
+                                        with open(edited_image_path, "rb") as f:
+                                            await bot.send_image_message(from_wxid, f.read())
+                                        # 添加延迟，确保图片发送完成
+                                        await asyncio.sleep(1.5)
+
+                                        # 更新会话历史
+                                        user_message = {
+                                            "role": "user",
+                                            "parts": [
+                                                {"text": prompt},
+                                                {"image_url": app_file_path}
+                                            ]
+                                        }
+                                        conversation_history.append(user_message)
+
+                                        assistant_message = {
+                                            "role": "model",
+                                            "parts": [
+                                                {"text": first_valid_text if first_valid_text else "我已编辑完成图片"},
+                                                {"image_url": edited_image_path}
+                                            ]
+                                        }
+                                        conversation_history.append(assistant_message)
+
+                                        # 更新会话历史
+                                        self.conversations[conversation_key] = conversation_history
+
+                                        # 更新会话时间戳
+                                        self.conversation_timestamps[conversation_key] = time.time()
+                                    else:
+                                        # 检查是否有文本响应，可能是内容被拒绝
+                                        first_valid_text = next((t for t in text_responses if t), None)
+                                        if first_valid_text:
+                                            # 内容审核拒绝的情况，翻译并转发拒绝消息给用户
+                                            translated_response = self._translate_gemini_message(first_valid_text)
+                                            await bot.send_at_message(from_wxid, f"\n{translated_response}", [sender_wxid])
+                                            logger.warning(f"API拒绝编辑图片，提示: {first_valid_text}")
+                                        else:
+                                            logger.error(f"编辑图片失败，未获取到有效的图片数据")
+                                            await bot.send_at_message(from_wxid, "\n图片编辑失败，请稍后再试或修改描述", [sender_wxid])
+                                except Exception as e:
+                                    logger.error(f"编辑图片失败: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    await bot.send_at_message(from_wxid, f"\n编辑图片失败: {str(e)}", [sender_wxid])
+                                return False  # 已处理命令，阻止后续插件执行
+
+            # 处理引用图片的反向提示词命令
+            elif is_reverse_command:
+                logger.info(f"检测到引用图片的反向提示词命令: {content}，使用的命令: {used_command}")
+
+                # 获取会话信息
+                from_wxid = message.get("FromWxid", "")
+                sender_wxid = message.get("SenderWxid", "")
+                conversation_key = f"{from_wxid}_{sender_wxid}"
+
+                # 检查积分
+                if self.enable_points and sender_wxid not in self.admins:
+                    points = self.db.get_points(sender_wxid)
+                    if points < self.reverse_cost:
+                        await bot.send_at_message(from_wxid, f"\n您的积分不足，反向提示词需要{self.reverse_cost}积分，您当前有{points}积分", [sender_wxid])
+                        return False  # 积分不足，阻止后续插件执行
+
+                # 尝试从引用消息中获取图片
+                reference_message = message.get("Quote", {})
+                if reference_message:
+                    logger.info(f"成功获取引用消息: {reference_message}")
+
+                    # 如果引用的是图片消息，处理引用的图片
+                    if reference_message.get("MsgType") == 3:  # 图片消息类型
+                        logger.info(f"引用的是图片消息，将处理引用的图片")
+
+                        # 尝试从引用消息中获取MD5
+                        ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                        if not ref_md5 and "Content" in reference_message:
+                            # 尝试从Content中提取MD5
+                            ref_content = reference_message.get("Content", "")
+                            md5_match = re.search(r'md5="([^"]+)"', ref_content)
+                            if md5_match:
+                                ref_md5 = md5_match.group(1)
+                                logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                        if ref_md5:
+                            # 尝试在/app/files/目录下查找图片
+                            app_file_path = None
+                            for ext in ['.jpeg', '.png', '.jpg']:
+                                temp_path = f"/app/files/{ref_md5}{ext}"
+                                if os.path.exists(temp_path):
+                                    app_file_path = temp_path
+                                    logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                                    break
+
+                            if app_file_path:
+                                # 直接使用系统缓存的图片路径
+                                self.last_images[conversation_key] = app_file_path
+                                logger.info(f"成功保存引用图片的系统缓存路径: {app_file_path}")
+
+                                # 反向提示词
+                                try:
+                                    # 发送处理中消息
+                                    await bot.send_at_message(from_wxid, "\n正在分析图片，生成提示词，请稍候...", [sender_wxid])
+
+                                    # 读取图片
+                                    with open(app_file_path, "rb") as f:
+                                        image_data = f.read()
+
+                                    # 扣除积分
+                                    if self.enable_points and sender_wxid not in self.admins:
+                                        self.db.add_points(sender_wxid, -self.reverse_cost)
+                                        points_after = self.db.get_points(sender_wxid)
+
+                                        # 如果启用了积分消息显示，发送积分消息
+                                        if self.show_points_message:
+                                            points_msg = f"已扣除{self.reverse_cost}积分，当前剩余{points_after}积分"
+                                            await bot.send_text_message(from_wxid, points_msg)
+                                            # 添加短暂延迟
+                                            await asyncio.sleep(0.5)
+
+                                    # 调用反向提示词API
+                                    prompt = await self._reverse_image(image_data)
+
+                                    if prompt:
+                                        # 发送提示词
+                                        await bot.send_text_message(from_wxid, f"图片提示词：\n{prompt}")
+                                    else:
+                                        await bot.send_at_message(from_wxid, "\n无法生成提示词，请稍后再试", [sender_wxid])
+                                except Exception as e:
+                                    logger.error(f"反向提示词失败: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    await bot.send_at_message(from_wxid, f"\n反向提示词失败: {str(e)}", [sender_wxid])
+                                return False  # 已处理命令，阻止后续插件执行
+
+            # 处理引用图片的分析命令
+            elif is_analyze_command:
+                logger.info(f"检测到引用图片的分析命令: {content}，使用的命令: {used_command}")
+
+                # 获取会话信息
+                from_wxid = message.get("FromWxid", "")
+                sender_wxid = message.get("SenderWxid", "")
+                conversation_key = f"{from_wxid}_{sender_wxid}"
+
+                # 提取用户的分析问题（如果有）
+                cmd_length = len(used_command)
+                user_query = content[cmd_length:].strip()
+
+                # 检查积分
+                if self.enable_points and sender_wxid not in self.admins:
+                    points = self.db.get_points(sender_wxid)
+                    if points < self.analysis_cost:
+                        await bot.send_at_message(from_wxid, f"\n您的积分不足，图片分析需要{self.analysis_cost}积分，您当前有{points}积分", [sender_wxid])
+                        return False  # 积分不足，阻止后续插件执行
+
+                # 尝试从引用消息中获取图片
+                reference_message = message.get("Quote", {})
+                if reference_message:
+                    logger.info(f"成功获取引用消息: {reference_message}")
+
+                    # 如果引用的是图片消息，处理引用的图片
+                    if reference_message.get("MsgType") == 3:  # 图片消息类型
+                        logger.info(f"引用的是图片消息，将处理引用的图片")
+
+                        # 尝试从引用消息中获取MD5
+                        ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                        if not ref_md5 and "Content" in reference_message:
+                            # 尝试从Content中提取MD5
+                            ref_content = reference_message.get("Content", "")
+                            md5_match = re.search(r'md5="([^"]+)"', ref_content)
+                            if md5_match:
+                                ref_md5 = md5_match.group(1)
+                                logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                        if ref_md5:
+                            # 尝试在/app/files/目录下查找图片
+                            app_file_path = None
+                            for ext in ['.jpeg', '.png', '.jpg']:
+                                temp_path = f"/app/files/{ref_md5}{ext}"
+                                if os.path.exists(temp_path):
+                                    app_file_path = temp_path
+                                    logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                                    break
+
+                            if app_file_path:
+                                # 直接使用系统缓存的图片路径
+                                self.last_images[conversation_key] = app_file_path
+                                logger.info(f"成功保存引用图片的系统缓存路径: {app_file_path}")
+
+                                # 图片分析
+                                try:
+                                    # 发送处理中消息
+                                    if user_query:
+                                        await bot.send_at_message(from_wxid, f"\n正在分析图片，特别关注：{user_query}，请稍候...", [sender_wxid])
+                                    else:
+                                        await bot.send_at_message(from_wxid, "\n正在分析图片，请稍候...", [sender_wxid])
+
+                                    # 读取图片
+                                    with open(app_file_path, "rb") as f:
+                                        image_data = f.read()
+
+                                    # 扣除积分
+                                    if self.enable_points and sender_wxid not in self.admins:
+                                        self.db.add_points(sender_wxid, -self.analysis_cost)
+                                        points_after = self.db.get_points(sender_wxid)
+
+                                        # 如果启用了积分消息显示，发送积分消息
+                                        if self.show_points_message:
+                                            points_msg = f"已扣除{self.analysis_cost}积分，当前剩余{points_after}积分"
+                                            await bot.send_text_message(from_wxid, points_msg)
+                                            # 添加短暂延迟
+                                            await asyncio.sleep(0.5)
+
+                                    # 调用图片分析API
+                                    logger.info(f"引用图片分析，使用用户查询: '{user_query}'")
+                                    analysis_result = await self._analyze_image(image_data, user_query)
+
+                                    if analysis_result:
+                                        # 发送分析结果
+                                        await bot.send_text_message(from_wxid, analysis_result)
+                                    else:
+                                        await bot.send_at_message(from_wxid, "\n无法分析图片，请稍后再试", [sender_wxid])
+                                except Exception as e:
+                                    logger.error(f"图片分析失败: {str(e)}")
+                                    logger.error(traceback.format_exc())
+                                    await bot.send_at_message(from_wxid, f"\n图片分析失败: {str(e)}", [sender_wxid])
+                                return False  # 已处理命令，阻止后续插件执行
 
         # 检查是否是融图命令
         # 尝试获取不同格式的消息内容
@@ -773,31 +1445,109 @@ class GeminiImage(PluginBase):
                     await bot.send_text_message(chat_id, f"您的积分不足，需要 {self.reverse_cost} 积分才能使用反向提示词功能，当前积分: {points}")
                     return False  # 阻断后续插件执行
 
-            # 检查是否有最近的图片
-            image_data = await self._get_recent_image(chat_id, user_id)
-            if image_data:
-                # 扣除积分
-                if self.enable_points and self.reverse_cost > 0:
-                    points_before = await self.db.get_user_points(user_id)
-                    await self.db.update_user_points(user_id, -self.reverse_cost)
-                    points_after = await self.db.get_user_points(user_id)
+            # 检查是否是引用图片的反向提示词命令
+            reference_id = message.get("ReferenceId", "")
+            if reference_id:
+                logger.info(f"检测到引用图片的反向提示词命令，引用ID: {reference_id}")
+                try:
+                    # 尝试从引用消息中获取图片
+                    reference_message = message.get("Quote", {})
 
-                    # 如果启用了积分消息显示，发送积分消息
-                    if self.show_points_message:
-                        points_msg = f"已扣除{self.reverse_cost}积分，当前剩余{points_after}积分"
-                        await bot.send_text_message(chat_id, points_msg)
-                        # 添加短暂延迟
-                        await asyncio.sleep(0.5)
+                    if reference_message:
+                        logger.info(f"成功获取引用消息: {reference_message}")
+                        # 记录完整的引用消息，帮助调试
+                        logger.info(f"引用消息完整内容: {reference_message}")
 
-                # 处理反向提示词请求
-                await self._handle_reverse_image(bot, message, image_data)
-                return False  # 阻断后续插件执行
-            else:
-                # 设置等待状态，等待用户上传图片
-                self.waiting_for_reverse_image[user_id] = True
-                self.waiting_for_reverse_image_time[user_id] = time.time()
-                await bot.send_text_message(chat_id, "请上传要生成提示词的图片")
-                return False  # 阻断后续插件执行
+                        # 如果引用的是图片消息，处理引用的图片
+                        if reference_message.get("MsgType") == 3:  # 图片消息类型
+                            logger.info(f"引用的是图片消息，将处理引用的图片")
+
+                            # 尝试从引用消息中获取MD5
+                            ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                            if not ref_md5 and "Content" in reference_message:
+                                # 尝试从Content中提取MD5
+                                content = reference_message.get("Content", "")
+                                md5_match = re.search(r'md5="([^"]+)"', content)
+                                if md5_match:
+                                    ref_md5 = md5_match.group(1)
+                                    logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                            if ref_md5:
+                                # 尝试在/app/files/目录下查找图片（检查多种格式）
+                                app_file_path = None
+                                for ext in ['.jpeg', '.png', '.jpg']:
+                                    temp_path = f"/app/files/{ref_md5}{ext}"
+                                    if os.path.exists(temp_path):
+                                        app_file_path = temp_path
+                                        logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                                        break
+
+                                if app_file_path:
+                                    # 读取图片数据
+                                    try:
+                                        with open(app_file_path, "rb") as f:
+                                            image_data = f.read()
+                                        logger.info(f"从系统缓存读取引用图片数据: {app_file_path}, 大小: {len(image_data)} 字节")
+
+                                        # 扣除积分
+                                        if self.enable_points and self.reverse_cost > 0:
+                                            points_before = await self.db.get_user_points(user_id)
+                                            await self.db.update_user_points(user_id, -self.reverse_cost)
+                                            points_after = await self.db.get_user_points(user_id)
+
+                                            # 如果启用了积分消息显示，发送积分消息
+                                            if self.show_points_message:
+                                                points_msg = f"已扣除{self.reverse_cost}积分，当前剩余{points_after}积分"
+                                                await bot.send_text_message(chat_id, points_msg)
+                                                # 添加短暂延迟
+                                                await asyncio.sleep(0.5)
+
+                                        # 处理反向提示词请求
+                                        await self._handle_reverse_image(bot, message, image_data)
+                                        return False  # 阻断后续插件执行
+                                    except Exception as e:
+                                        logger.error(f"读取系统缓存图片失败: {e}")
+                                        logger.error(traceback.format_exc())
+
+                            # 尝试获取引用图片的路径
+                            ref_img_path = reference_message.get("FilePath")
+                            if ref_img_path and os.path.exists(ref_img_path):
+                                try:
+                                    logger.info(f"找到引用图片路径: {ref_img_path}")
+
+                                    # 读取图片数据
+                                    with open(ref_img_path, "rb") as f:
+                                        image_data = f.read()
+                                    logger.info(f"从引用图片路径读取图片数据: {ref_img_path}, 大小: {len(image_data)} 字节")
+
+                                    # 扣除积分
+                                    if self.enable_points and self.reverse_cost > 0:
+                                        points_before = await self.db.get_user_points(user_id)
+                                        await self.db.update_user_points(user_id, -self.reverse_cost)
+                                        points_after = await self.db.get_user_points(user_id)
+
+                                        # 如果启用了积分消息显示，发送积分消息
+                                        if self.show_points_message:
+                                            points_msg = f"已扣除{self.reverse_cost}积分，当前剩余{points_after}积分"
+                                            await bot.send_text_message(chat_id, points_msg)
+                                            # 添加短暂延迟
+                                            await asyncio.sleep(0.5)
+
+                                    # 处理反向提示词请求
+                                    await self._handle_reverse_image(bot, message, image_data)
+                                    return False  # 阻断后续插件执行
+                                except Exception as e:
+                                    logger.error(f"处理引用图片路径失败: {e}")
+                                    logger.error(traceback.format_exc())
+                except Exception as e:
+                    logger.error(f"处理引用图片失败: {e}")
+                    logger.error(traceback.format_exc())
+
+            # 设置等待状态，等待用户上传图片
+            self.waiting_for_reverse_image[user_id] = True
+            self.waiting_for_reverse_image_time[user_id] = time.time()
+            await bot.send_text_message(chat_id, "请上传要生成提示词的图片")
+            return False  # 阻断后续插件执行
 
         # 处理图片分析命令 - 使用正则表达式来检查命令
         analysis_cmd_pattern = '|'.join(re.escape(cmd) for cmd in self.image_analysis_commands)
@@ -816,44 +1566,120 @@ class GeminiImage(PluginBase):
                     await bot.send_text_message(chat_id, f"您的积分不足，需要 {self.analysis_cost} 积分才能使用图片分析功能，当前积分: {points}")
                     return False  # 阻断后续插件执行
 
-            # 检查是否有最近的图片
-            image_data = await self._get_recent_image(chat_id, user_id)
-            if image_data:
-                # 扣除积分
-                if self.enable_points and self.analysis_cost > 0:
-                    points_before = await self.db.get_user_points(user_id)
-                    await self.db.update_user_points(user_id, -self.analysis_cost)
-                    points_after = await self.db.get_user_points(user_id)
+            # 保存用户的分析问题
+            if user_query:
+                self.waiting_for_analyze_image_query[user_id] = user_query
+                logger.info(f"保存用户分析问题: {user_query}")
 
-                    # 如果启用了积分消息显示，发送积分消息
-                    if self.show_points_message:
-                        points_msg = f"已扣除{self.analysis_cost}积分，当前剩余{points_after}积分"
-                        await bot.send_text_message(chat_id, points_msg)
-                        # 添加短暂延迟
-                        await asyncio.sleep(0.5)
+            # 检查是否是引用图片的分析命令
+            reference_id = message.get("ReferenceId", "")
+            if reference_id:
+                logger.info(f"检测到引用图片的分析命令，引用ID: {reference_id}")
+                try:
+                    # 尝试从引用消息中获取图片
+                    reference_message = message.get("Quote", {})
 
-                # 保存用户的分析问题
-                if user_query:
-                    self.waiting_for_analyze_image_query[user_id] = user_query
-                    logger.info(f"保存用户分析问题: {user_query}")
+                    if reference_message:
+                        logger.info(f"成功获取引用消息: {reference_message}")
+                        # 记录完整的引用消息，帮助调试
+                        logger.info(f"引用消息完整内容: {reference_message}")
 
-                # 处理图片分析请求
-                await self._handle_analyze_image(bot, message, image_data)
-                return False  # 阻断后续插件执行
+                        # 如果引用的是图片消息，处理引用的图片
+                        if reference_message.get("MsgType") == 3:  # 图片消息类型
+                            logger.info(f"引用的是图片消息，将处理引用的图片")
+
+                            # 尝试从引用消息中获取MD5
+                            ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                            if not ref_md5 and "Content" in reference_message:
+                                # 尝试从Content中提取MD5
+                                content = reference_message.get("Content", "")
+                                md5_match = re.search(r'md5="([^"]+)"', content)
+                                if md5_match:
+                                    ref_md5 = md5_match.group(1)
+                                    logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                            if ref_md5:
+                                # 尝试在/app/files/目录下查找图片（检查多种格式）
+                                app_file_path = None
+                                for ext in ['.jpeg', '.png', '.jpg']:
+                                    temp_path = f"/app/files/{ref_md5}{ext}"
+                                    if os.path.exists(temp_path):
+                                        app_file_path = temp_path
+                                        logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                                        break
+
+                                if app_file_path:
+                                    # 读取图片数据
+                                    try:
+                                        with open(app_file_path, "rb") as f:
+                                            image_data = f.read()
+                                        logger.info(f"从系统缓存读取引用图片数据: {app_file_path}, 大小: {len(image_data)} 字节")
+
+                                        # 扣除积分
+                                        if self.enable_points and self.analysis_cost > 0:
+                                            points_before = await self.db.get_user_points(user_id)
+                                            await self.db.update_user_points(user_id, -self.analysis_cost)
+                                            points_after = await self.db.get_user_points(user_id)
+
+                                            # 如果启用了积分消息显示，发送积分消息
+                                            if self.show_points_message:
+                                                points_msg = f"已扣除{self.analysis_cost}积分，当前剩余{points_after}积分"
+                                                await bot.send_text_message(chat_id, points_msg)
+                                                # 添加短暂延迟
+                                                await asyncio.sleep(0.5)
+
+                                        # 处理图片分析请求
+                                        await self._handle_analyze_image(bot, message, image_data)
+                                        return False  # 阻断后续插件执行
+                                    except Exception as e:
+                                        logger.error(f"读取系统缓存图片失败: {e}")
+                                        logger.error(traceback.format_exc())
+
+                            # 尝试获取引用图片的路径
+                            ref_img_path = reference_message.get("FilePath")
+                            if ref_img_path and os.path.exists(ref_img_path):
+                                try:
+                                    logger.info(f"找到引用图片路径: {ref_img_path}")
+
+                                    # 读取图片数据
+                                    with open(ref_img_path, "rb") as f:
+                                        image_data = f.read()
+                                    logger.info(f"从引用图片路径读取图片数据: {ref_img_path}, 大小: {len(image_data)} 字节")
+
+                                    # 扣除积分
+                                    if self.enable_points and self.analysis_cost > 0:
+                                        points_before = await self.db.get_user_points(user_id)
+                                        await self.db.update_user_points(user_id, -self.analysis_cost)
+                                        points_after = await self.db.get_user_points(user_id)
+
+                                        # 如果启用了积分消息显示，发送积分消息
+                                        if self.show_points_message:
+                                            points_msg = f"已扣除{self.analysis_cost}积分，当前剩余{points_after}积分"
+                                            await bot.send_text_message(chat_id, points_msg)
+                                            # 添加短暂延迟
+                                            await asyncio.sleep(0.5)
+
+                                    # 处理图片分析请求
+                                    await self._handle_analyze_image(bot, message, image_data)
+                                    return False  # 阻断后续插件执行
+                                except Exception as e:
+                                    logger.error(f"处理引用图片路径失败: {e}")
+                                    logger.error(traceback.format_exc())
+                except Exception as e:
+                    logger.error(f"处理引用图片失败: {e}")
+                    logger.error(traceback.format_exc())
+
+            # 设置等待状态，等待用户上传图片
+            self.waiting_for_analyze_image[user_id] = True
+            self.waiting_for_analyze_image_time[user_id] = time.time()
+
+            # 发送提示消息
+            if user_query:
+                await bot.send_text_message(chat_id, f"请上传要分析的图片，我将特别关注：{user_query}")
             else:
-                # 设置等待状态，等待用户上传图片
-                self.waiting_for_analyze_image[user_id] = True
-                self.waiting_for_analyze_image_time[user_id] = time.time()
+                await bot.send_text_message(chat_id, "请上传要分析的图片")
 
-                # 保存用户的分析问题
-                if user_query:
-                    self.waiting_for_analyze_image_query[user_id] = user_query
-                    logger.info(f"保存用户分析问题: {user_query}")
-                    await bot.send_text_message(chat_id, f"请上传要分析的图片，我将特别关注：{user_query}")
-                else:
-                    await bot.send_text_message(chat_id, "请上传要分析的图片")
-
-                return False  # 阻断后续插件执行
+            return False  # 阻断后续插件执行
 
         # 处理提示词生成命令 - 使用正则表达式来检查命令
         prompt_cmd_pattern = '|'.join(re.escape(cmd) for cmd in self.prompt_enhance_commands)
@@ -1220,6 +2046,10 @@ class GeminiImage(PluginBase):
         # 检查是否是编辑图片命令（针对已保存的图片）
         for cmd in self.edit_commands:
             if content.startswith(cmd):
+                # 清理过期缓存
+                self._cleanup_image_cache()
+                logger.info("编辑图片命令：清理过期缓存，优先使用系统缓存的图片")
+
                 # 提取提示词
                 prompt = content[len(cmd):].strip()
                 if not prompt:
@@ -1231,34 +2061,65 @@ class GeminiImage(PluginBase):
                     await bot.send_at_message(from_wxid, "\n请先在配置文件中设置Gemini API密钥", [sender_wxid])
                     return False
 
-                # 先尝试从缓存获取最近的图片
-                image_data = await self._get_recent_image(from_wxid, sender_wxid)
-                if image_data:
-                    # 如果找到缓存的图片，保存到本地再处理
-                    image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
-                    with open(image_path, "wb") as f:
-                        f.write(image_data)
-                    self.last_images[conversation_key] = image_path
-                    logger.info(f"找到最近缓存的图片，保存到：{image_path}")
+                # 检查是否是引用图片的编辑命令
+                reference_id = message.get("ReferenceId", "")
+                if reference_id:
+                    logger.info(f"检测到引用图片的编辑命令，引用ID: {reference_id}")
+                    try:
+                        # 尝试从引用消息中获取图片
+                        reference_message = message.get("Quote", {})
 
-                    # 再次保存到缓存，确保使用了所有可能的键格式
-                    self._save_image_to_cache(from_wxid, sender_wxid, image_data)
+                        if reference_message:
+                            logger.info(f"成功获取引用消息: {reference_message}")
+                            # 记录完整的引用消息，帮助调试
+                            logger.info(f"引用消息完整内容: {reference_message}")
 
-                # 检查是否有上一次上传/生成的图片
-                last_image_path = self.last_images.get(conversation_key)
-                if not last_image_path or not os.path.exists(last_image_path):
-                    # 再次尝试查找图片，使用更宽松的条件
-                    logger.info("未找到图片路径，尝试使用更宽松的条件再次查找")
-                    for key, value in self.last_images.items():
-                        # 只有当会话活跃时才使用宽松条件查找图片
-                        if key in self.conversations and (from_wxid in key or sender_wxid in key) and os.path.exists(value):
-                            last_image_path = value
-                            logger.info(f"使用宽松条件找到图片路径: {last_image_path}, 键: {key}")
-                            break
+                            # 如果引用的是图片消息，处理引用的图片
+                            if reference_message.get("MsgType") == 3:  # 图片消息类型
+                                logger.info(f"引用的是图片消息，将处理引用的图片")
 
-                    if not last_image_path or not os.path.exists(last_image_path):
-                        await bot.send_at_message(from_wxid, "\n未找到可编辑的图片，请先上传一张图片", [sender_wxid])
-                        return False
+                                # 尝试从引用消息中获取MD5
+                                ref_md5 = reference_message.get("md5", reference_message.get("FileMd5", ""))
+                                if not ref_md5 and "Content" in reference_message:
+                                    # 尝试从Content中提取MD5
+                                    content = reference_message.get("Content", "")
+                                    md5_match = re.search(r'md5="([^"]+)"', content)
+                                    if md5_match:
+                                        ref_md5 = md5_match.group(1)
+                                        logger.info(f"从Content中提取到MD5: {ref_md5}")
+
+                                if ref_md5:
+                                    # 尝试在/app/files/目录下查找图片（检查多种格式）
+                                    app_file_path = None
+                                    for ext in ['.jpeg', '.png', '.jpg']:
+                                        temp_path = f"/app/files/{ref_md5}{ext}"
+                                        if os.path.exists(temp_path):
+                                            app_file_path = temp_path
+                                            logger.info(f"找到引用图片的系统缓存: {app_file_path}")
+                                            break
+
+                                    if app_file_path:
+                                        # 直接使用系统缓存的图片路径
+                                        self.last_images[conversation_key] = app_file_path
+                                        logger.info(f"成功保存引用图片的系统缓存路径: {app_file_path}")
+                                        # 不使用continue，让代码继续执行后续的编辑命令处理
+
+                                # 尝试获取引用图片的路径
+                                ref_img_path = reference_message.get("FilePath")
+                                if ref_img_path and os.path.exists(ref_img_path):
+                                    try:
+                                        logger.info(f"找到引用图片路径: {ref_img_path}")
+
+                                        # 直接使用引用图片的路径
+                                        self.last_images[conversation_key] = ref_img_path
+                                        logger.info(f"成功保存引用图片路径: {ref_img_path}")
+                                        # 不使用continue，让代码继续执行后续的编辑命令处理
+                                    except Exception as e:
+                                        logger.error(f"处理引用图片路径失败: {e}")
+                                        logger.error(traceback.format_exc())
+                    except Exception as e:
+                        logger.error(f"处理引用图片失败: {e}")
+                        logger.error(traceback.format_exc())
 
                 # 检查积分
                 if self.enable_points and sender_wxid not in self.admins:
@@ -1267,164 +2128,15 @@ class GeminiImage(PluginBase):
                         await bot.send_at_message(from_wxid, f"\n您的积分不足，编辑图片需要{self.edit_cost}积分，您当前有{points}积分", [sender_wxid])
                         return False  # 积分不足，阻止后续插件执行
 
-                # 编辑图片
-                try:
-                    # 发送处理中消息
-                    await bot.send_at_message(from_wxid, "\n正在编辑图片，请稍候...", [sender_wxid])
+                # 设置等待状态，等待用户上传图片
+                self.waiting_for_edit_image[sender_wxid] = True
+                self.waiting_for_edit_image_time[sender_wxid] = time.time()
+                self.waiting_for_edit_image_prompt[sender_wxid] = prompt
 
-                    # 读取上一次的图片
-                    with open(last_image_path, "rb") as f:
-                        image_data = f.read()
+                # 发送提示消息
+                await bot.send_at_message(from_wxid, "\n请上传要编辑的图片", [sender_wxid])
+                logger.info(f"用户 {sender_wxid} 开始等待上传图片进行编辑，提示词: {prompt}")
 
-                    # 获取会话上下文
-                    conversation_history = self.conversations[conversation_key]
-
-                    # 调用Gemini API编辑图片
-                    edited_images, text_responses = await self._edit_image(prompt, image_data, conversation_history)
-
-                    # 确保 edited_images 和 text_responses 不为 None
-                    if edited_images is None:
-                        edited_images = []
-                    if text_responses is None:
-                        text_responses = []
-
-                    if len(edited_images) > 0 and edited_images[0]:
-                        # 保存编辑后的图片
-                        edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
-                        logger.info(f"保存编辑后的图片到: {edited_image_path}, 数据大小: {len(edited_images[0])} 字节")
-                        # 检查图片数据是否有效
-                        if edited_images[0][:8].hex().startswith('89504e47') or edited_images[0][:3].hex().startswith('ffd8ff'):
-                            logger.info(f"图片数据是有效的PNG或JPEG格式")
-                        else:
-                            logger.warning(f"图片数据不是标准的PNG或JPEG格式")
-                        with open(edited_image_path, "wb") as f:
-                            f.write(edited_images[0])
-
-                        # 更新最后生成的图片路径
-                        self.last_images[conversation_key] = edited_image_path
-
-                        # 扣除积分
-                        if self.enable_points and sender_wxid not in self.admins:
-                            self.db.add_points(sender_wxid, -self.edit_cost)
-                            points_msg = f"已扣除{self.edit_cost}积分，当前剩余{points - self.edit_cost}积分"
-                        else:
-                            points_msg = ""
-
-                        # 如果不显示积分消息，清空积分消息
-                        if not self.show_points_message:
-                            points_msg = ""
-
-                        # 发送文本回复（如果有）
-                        first_valid_text = next((t for t in text_responses if t), None)
-                        if first_valid_text:
-                            # 清理文本，去除多余的空格和换行
-                            cleaned_text = first_valid_text.strip()
-                            # 将多个连续空格替换为单个空格
-                            import re
-                            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-                            # 移除文本开头和结尾的引号
-                            if cleaned_text.startswith('"') and cleaned_text.endswith('"'):
-                                cleaned_text = cleaned_text[1:-1]
-                            # 构建消息文本，避免在没有积分消息时添加多余的换行
-                            if points_msg:
-                                message_text = f"{cleaned_text}\n\n{points_msg}"
-                            else:
-                                message_text = cleaned_text
-                            await bot.send_text_message(from_wxid, message_text)
-                        else:
-                            await bot.send_text_message(from_wxid, f"图片编辑成功！{points_msg if points_msg else ''}")
-                        # 添加短暂延迟，确保文本发送完成
-                        await asyncio.sleep(0.5)
-
-                        # 发送图片
-                        logger.info(f"准备发送编辑后的图片: {edited_image_path}")
-                        try:
-                            with open(edited_image_path, "rb") as f:
-                                image_data = f.read()
-                                # 检查图片数据是否有效
-                                if image_data[:8].hex().startswith('89504e47') or image_data[:3].hex().startswith('ffd8ff'):
-                                    logger.info(f"读取的图片数据是有效的PNG或JPEG格式")
-                                else:
-                                    logger.warning(f"读取的图片数据不是标准的PNG或JPEG格式")
-                                await bot.send_image_message(from_wxid, image_data)
-                                # 添加延迟，确保图片发送完成
-                                await asyncio.sleep(1.5)
-                        except Exception as e:
-                            logger.error(f"发送图片失败: {str(e)}")
-                            logger.error(traceback.format_exc())
-
-                        # 不再发送对话提示
-                        # if not conversation_history:  # 如果是新会话
-                        #     await bot.send_text_message(from_wxid, f"已开始图像对话，可以直接发消息继续修改图片。需要结束时请发送\"{self.exit_commands[0]}\"")
-
-                        # 更新会话历史
-                        user_message = {
-                            "role": "user",
-                            "parts": [
-                                {"text": prompt},
-                                {"image_url": last_image_path}
-                            ]
-                        }
-                        conversation_history.append(user_message)
-
-                        assistant_message = {
-                            "role": "model",
-                            "parts": [
-                                {"text": first_valid_text if first_valid_text else "我已编辑完成图片"},
-                                {"image_url": edited_image_path}
-                            ]
-                        }
-                        conversation_history.append(assistant_message)
-
-                        # 限制会话历史长度
-                        if len(conversation_history) > 10:  # 保留最近5轮对话
-                            conversation_history = conversation_history[-10:]
-
-                        # 更新会话时间戳
-                        self.conversation_timestamps[conversation_key] = time.time()
-                    else:
-                        # 检查是否有文本响应，可能是内容被拒绝
-                        first_valid_text = next((t for t in text_responses if t), None)
-                        if first_valid_text:
-                            # 内容审核拒绝的情况，翻译并转发拒绝消息给用户
-                            # 检查是否是JSON格式的错误信息
-                            try:
-                                error_data = json.loads(first_valid_text)
-                                # 构建友好的错误消息
-                                error_message = "图片编辑请求被拒绝。"
-
-                                # 尝试从错误数据中提取有用信息
-                                if "candidates" in error_data and error_data["candidates"]:
-                                    candidate = error_data["candidates"][0]
-                                    if "finishReason" in candidate:
-                                        error_message += f"原因: {candidate['finishReason']}. "
-
-                                    if "safetyRatings" in candidate:
-                                        blocked_categories = []
-                                        for rating in candidate["safetyRatings"]:
-                                            if rating.get("blocked", False):
-                                                category = rating.get("category", "未知类别")
-                                                probability = rating.get("probability", "未知")
-                                                blocked_categories.append(f"{category}({probability})")
-
-                                        if blocked_categories:
-                                            error_message += f"被拒绝的类别: {', '.join(blocked_categories)}。"
-
-                                error_message += "请修改您的请求。"
-                                translated_response = error_message
-                            except json.JSONDecodeError:
-                                # 不是JSON格式，使用常规翻译
-                                translated_response = self._translate_gemini_message(first_valid_text)
-
-                            await bot.send_at_message(from_wxid, f"\n{translated_response}", [sender_wxid])
-                            logger.warning(f"API拒绝编辑图片，提示: {first_valid_text}")
-                        else:
-                            logger.error(f"编辑图片失败，未获取到有效的图片数据")
-                            await bot.send_at_message(from_wxid, "\n图片编辑失败，请稍后再试或修改描述", [sender_wxid])
-                except Exception as e:
-                    logger.error(f"编辑图片失败: {str(e)}")
-                    logger.error(traceback.format_exc())
-                    await bot.send_at_message(from_wxid, f"\n编辑图片失败: {str(e)}", [sender_wxid])
                 return False  # 已处理命令，阻止后续插件执行
 
         # 这部分代码已经在前面处理过了，不需要重复处理
@@ -1486,18 +2198,33 @@ class GeminiImage(PluginBase):
                 # 如果没有找到图片路径，尝试从缓存获取
                 if not last_image_path or not os.path.exists(last_image_path):
                     logger.info("未找到上一次图片路径，尝试从缓存获取")
-                    image_data = await self._get_recent_image(from_wxid, sender_wxid)
-                    if image_data:
-                        # 如果找到缓存的图片，保存到本地再处理
-                        image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
-                        with open(image_path, "wb") as f:
-                            f.write(image_data)
-                        self.last_images[conversation_key] = image_path
-                        last_image_path = image_path
-                        logger.info(f"从缓存找到图片，保存到：{image_path}")
 
-                        # 再次保存到缓存，确保使用了所有可能的键格式
-                        self._save_image_to_cache(from_wxid, sender_wxid, image_data)
+                    # 检查是否有系统缓存的图片路径
+                    for key, value in self.last_images.items():
+                        if (from_wxid in key or sender_wxid in key) and os.path.exists(value):
+                            if "/app/files/" in value:
+                                # 直接使用系统缓存的图片路径
+                                last_image_path = value
+                                self.last_images[conversation_key] = last_image_path
+                                logger.info(f"直接使用系统缓存的图片路径: {last_image_path}")
+                                break
+
+                    # 如果没有找到系统缓存的图片路径，尝试从缓存获取图片
+                    if not last_image_path or not os.path.exists(last_image_path):
+                        path, data = await self._get_recent_image(from_wxid, sender_wxid)
+                        if path:
+                            # 如果找到图片路径，直接使用
+                            last_image_path = path
+                            self.last_images[conversation_key] = last_image_path
+                            logger.info(f"直接使用缓存的图片路径: {last_image_path}")
+                        elif data:
+                            # 如果找到图片数据，保存到本地再处理
+                            image_path = os.path.join(self.save_dir, f"temp_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                            with open(image_path, "wb") as f:
+                                f.write(data)
+                            self.last_images[conversation_key] = image_path
+                            last_image_path = image_path
+                            logger.info(f"从缓存找到图片数据，保存到：{image_path}")
                     else:
                         # 尝试使用更宽松的条件查找图片路径
                         logger.info("未找到缓存图片，尝试使用更宽松的条件查找图片路径")
@@ -1909,7 +2636,7 @@ class GeminiImage(PluginBase):
         # 不是本插件的命令，继续执行后续插件
         return True
 
-    @on_file_message(priority=30)
+    @on_file_message(priority=200)
     async def handle_edit_image(self, bot: WechatAPIClient, message: dict) -> bool:
         """处理编辑图片的命令"""
         if not self.enable:
@@ -2072,7 +2799,7 @@ class GeminiImage(PluginBase):
         # 不是本插件的命令，继续执行后续插件
         return True
 
-    @on_image_message(priority=30)
+    @on_image_message(priority=200)
     async def handle_image_edit(self, bot: WechatAPIClient, message: dict) -> bool:
         """处理图片消息，缓存图片数据以备后续编辑使用"""
         if not self.enable:
@@ -2150,6 +2877,25 @@ class GeminiImage(PluginBase):
                     points_after = await self.db.get_user_points(user_id)
                     logger.info(f"用户 {user_id} 图片分析扣除积分 {self.analysis_cost}，积分变化: {points_before} -> {points_after}")
 
+        # 检查是否在等待编辑图片
+        if user_id in self.waiting_for_edit_image and self.waiting_for_edit_image[user_id]:
+            # 检查是否超时
+            if time.time() - self.waiting_for_edit_image_time[user_id] > self.edit_image_wait_timeout:
+                # 超时，清除等待状态
+                del self.waiting_for_edit_image[user_id]
+                del self.waiting_for_edit_image_time[user_id]
+                if user_id in self.waiting_for_edit_image_prompt:
+                    del self.waiting_for_edit_image_prompt[user_id]
+                await bot.send_text_message(chat_id, "编辑图片等待超时，请重新开始")
+            else:
+                # 未超时，处理编辑图片请求
+                # 扣除积分
+                if self.enable_points and self.edit_cost > 0:
+                    points_before = await self.db.get_user_points(user_id)
+                    await self.db.update_user_points(user_id, -self.edit_cost)
+                    points_after = await self.db.get_user_points(user_id)
+                    logger.info(f"用户 {user_id} 编辑图片扣除积分 {self.edit_cost}，积分变化: {points_before} -> {points_after}")
+
         # 在群聊中，使用发送者ID作为图片所有者
         # 在私聊中，FromWxid和SenderWxid相同
         is_group = message.get("IsGroup", False)
@@ -2159,7 +2905,35 @@ class GeminiImage(PluginBase):
             # 清理过期缓存
             self._cleanup_image_cache()
 
-            # 提取图片数据 - 首先尝试直接从ImgBuf获取
+            # 尝试从MD5获取图片路径（优先使用系统缓存）
+            md5 = message.get("FileMd5", message.get("md5", ""))
+            if md5:
+                # 尝试在/app/files/目录下查找图片（检查多种格式）
+                for ext in ['.jpeg', '.png', '.jpg']:
+                    app_file_path = f"/app/files/{md5}{ext}"
+                    if os.path.exists(app_file_path):
+                        logger.info(f"找到系统缓存的图片: {app_file_path}")
+                        break
+                else:
+                    # 如果循环正常结束（没有break），说明没有找到图片
+                    app_file_path = None
+
+                if app_file_path:
+
+                    # 直接使用系统缓存的图片路径
+                    self._save_image_to_cache(from_wxid, image_owner, None, app_file_path)
+                    return False  # 成功处理图片，阻断后续插件执行
+
+            # 如果没有MD5或系统缓存不存在，尝试从FilePath获取
+            file_path = message.get("FilePath", "")
+            if file_path and os.path.exists(file_path):
+                logger.info(f"找到图片路径: {file_path}")
+
+                # 直接使用图片路径
+                self._save_image_to_cache(from_wxid, image_owner, None, file_path)
+                return False  # 成功处理图片，阻断后续插件执行
+
+            # 如果没有路径，尝试直接从ImgBuf获取
             if "ImgBuf" in message and message["ImgBuf"] and len(message["ImgBuf"]) > 100:
                 image_data = message["ImgBuf"]
                 logger.info(f"从ImgBuf提取到图片数据，大小: {len(image_data)} 字节")
@@ -2223,6 +2997,99 @@ class GeminiImage(PluginBase):
                     await self._handle_analyze_image(bot, message, image_data)
                     return False  # 阻断后续插件执行
 
+                # 处理编辑图片请求
+                if user_id in self.waiting_for_edit_image and self.waiting_for_edit_image[user_id]:
+                    # 获取提示词
+                    prompt = self.waiting_for_edit_image_prompt.get(user_id, "")
+
+                    # 清除等待状态
+                    del self.waiting_for_edit_image[user_id]
+                    del self.waiting_for_edit_image_time[user_id]
+                    if user_id in self.waiting_for_edit_image_prompt:
+                        del self.waiting_for_edit_image_prompt[user_id]
+
+                    # 发送处理中消息
+                    await bot.send_text_message(chat_id, "正在编辑图片，请稍候...")
+
+                    # 获取会话上下文
+                    conversation_key = f"{chat_id}_{user_id}"
+                    conversation_history = self.conversations.get(conversation_key, [])
+
+                    # 保存原始图片
+                    orig_image_path = os.path.join(self.save_dir, f"orig_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                    with open(orig_image_path, "wb") as f:
+                        f.write(image_data)
+
+                    # 调用Gemini API编辑图片
+                    edited_images, text_responses = await self._edit_image(prompt, image_data, conversation_history)
+
+                    # 确保 edited_images 和 text_responses 不为 None
+                    if edited_images is None:
+                        edited_images = []
+                    if text_responses is None:
+                        text_responses = []
+
+                    if len(edited_images) > 0 and edited_images[0]:
+                        # 保存编辑后的图片
+                        edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                        with open(edited_image_path, "wb") as f:
+                            f.write(edited_images[0])
+
+                        # 更新最后生成的图片路径
+                        self.last_images[conversation_key] = edited_image_path
+
+                        # 发送文本回复（如果有）
+                        first_valid_text = next((t for t in text_responses if t), None)
+                        if first_valid_text:
+                            await bot.send_text_message(chat_id, first_valid_text)
+                        else:
+                            await bot.send_text_message(chat_id, "图片编辑成功！")
+
+                        # 添加短暂延迟，确保文本发送完成
+                        await asyncio.sleep(0.5)
+
+                        # 发送图片
+                        with open(edited_image_path, "rb") as f:
+                            await bot.send_image_message(chat_id, f.read())
+
+                        # 更新会话历史
+                        user_message = {
+                            "role": "user",
+                            "parts": [
+                                {"text": prompt},
+                                {"image_url": orig_image_path}
+                            ]
+                        }
+                        conversation_history.append(user_message)
+
+                        assistant_message = {
+                            "role": "model",
+                            "parts": [
+                                {"text": first_valid_text if first_valid_text else "我已编辑完成图片"},
+                                {"image_url": edited_image_path}
+                            ]
+                        }
+                        conversation_history.append(assistant_message)
+
+                        # 更新会话历史
+                        self.conversations[conversation_key] = conversation_history
+
+                        # 更新会话时间戳
+                        self.conversation_timestamps[conversation_key] = time.time()
+                    else:
+                        # 检查是否有文本响应，可能是内容被拒绝
+                        first_valid_text = next((t for t in text_responses if t), None)
+                        if first_valid_text:
+                            # 内容审核拒绝的情况，翻译并转发拒绝消息给用户
+                            translated_response = self._translate_gemini_message(first_valid_text)
+                            await bot.send_text_message(chat_id, translated_response)
+                            logger.warning(f"API拒绝编辑图片，提示: {first_valid_text}")
+                        else:
+                            logger.error(f"编辑图片失败，未获取到有效的图片数据")
+                            await bot.send_text_message(chat_id, "图片编辑失败，请稍后再试或修改描述")
+
+                    return False  # 阻断后续插件执行
+
                 return False  # 阻断后续插件执行
 
             # 如果ImgBuf中没有有效数据，尝试从Content中提取Base64图片数据
@@ -2244,7 +3111,6 @@ class GeminiImage(PluginBase):
 
                                     # 保存图片到缓存
                                     self._save_image_to_cache(from_wxid, image_owner, image_data)
-                                    return True
                                 except Exception as e:
                                     logger.error(f"XML后Base64解码失败: {e}")
 
@@ -2277,7 +3143,6 @@ class GeminiImage(PluginBase):
                                                 "content": image_data,
                                                 "timestamp": time.time()
                                             }
-                                            return False  # 阻断后续插件执行
                                     except Exception as e:
                                         logger.error(f"提取{marker}格式图片数据失败: {e}")
                     except Exception as e:
@@ -2357,6 +3222,99 @@ class GeminiImage(PluginBase):
                                         await self._handle_analyze_image(bot, message, image_data)
                                         return False  # 阻断后续插件执行
 
+                                    # 处理编辑图片请求
+                                    if user_id in self.waiting_for_edit_image and self.waiting_for_edit_image[user_id]:
+                                        # 获取提示词
+                                        prompt = self.waiting_for_edit_image_prompt.get(user_id, "")
+
+                                        # 清除等待状态
+                                        del self.waiting_for_edit_image[user_id]
+                                        del self.waiting_for_edit_image_time[user_id]
+                                        if user_id in self.waiting_for_edit_image_prompt:
+                                            del self.waiting_for_edit_image_prompt[user_id]
+
+                                        # 发送处理中消息
+                                        await bot.send_text_message(chat_id, "正在编辑图片，请稍候...")
+
+                                        # 获取会话上下文
+                                        conversation_key = f"{chat_id}_{user_id}"
+                                        conversation_history = self.conversations.get(conversation_key, [])
+
+                                        # 保存原始图片
+                                        orig_image_path = os.path.join(self.save_dir, f"orig_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                                        with open(orig_image_path, "wb") as f:
+                                            f.write(image_data)
+
+                                        # 调用Gemini API编辑图片
+                                        edited_images, text_responses = await self._edit_image(prompt, image_data, conversation_history)
+
+                                        # 确保 edited_images 和 text_responses 不为 None
+                                        if edited_images is None:
+                                            edited_images = []
+                                        if text_responses is None:
+                                            text_responses = []
+
+                                        if len(edited_images) > 0 and edited_images[0]:
+                                            # 保存编辑后的图片
+                                            edited_image_path = os.path.join(self.save_dir, f"edited_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+                                            with open(edited_image_path, "wb") as f:
+                                                f.write(edited_images[0])
+
+                                            # 更新最后生成的图片路径
+                                            self.last_images[conversation_key] = edited_image_path
+
+                                            # 发送文本回复（如果有）
+                                            first_valid_text = next((t for t in text_responses if t), None)
+                                            if first_valid_text:
+                                                await bot.send_text_message(chat_id, first_valid_text)
+                                            else:
+                                                await bot.send_text_message(chat_id, "图片编辑成功！")
+
+                                            # 添加短暂延迟，确保文本发送完成
+                                            await asyncio.sleep(0.5)
+
+                                            # 发送图片
+                                            with open(edited_image_path, "rb") as f:
+                                                await bot.send_image_message(chat_id, f.read())
+
+                                            # 更新会话历史
+                                            user_message = {
+                                                "role": "user",
+                                                "parts": [
+                                                    {"text": prompt},
+                                                    {"image_url": orig_image_path}
+                                                ]
+                                            }
+                                            conversation_history.append(user_message)
+
+                                            assistant_message = {
+                                                "role": "model",
+                                                "parts": [
+                                                    {"text": first_valid_text if first_valid_text else "我已编辑完成图片"},
+                                                    {"image_url": edited_image_path}
+                                                ]
+                                            }
+                                            conversation_history.append(assistant_message)
+
+                                            # 更新会话历史
+                                            self.conversations[conversation_key] = conversation_history
+
+                                            # 更新会话时间戳
+                                            self.conversation_timestamps[conversation_key] = time.time()
+                                        else:
+                                            # 检查是否有文本响应，可能是内容被拒绝
+                                            first_valid_text = next((t for t in text_responses if t), None)
+                                            if first_valid_text:
+                                                # 内容审核拒绝的情况，翻译并转发拒绝消息给用户
+                                                translated_response = self._translate_gemini_message(first_valid_text)
+                                                await bot.send_text_message(chat_id, translated_response)
+                                                logger.warning(f"API拒绝编辑图片，提示: {first_valid_text}")
+                                            else:
+                                                logger.error(f"编辑图片失败，未获取到有效的图片数据")
+                                                await bot.send_text_message(chat_id, "图片编辑失败，请稍后再试或修改描述")
+
+                                        return False  # 阻断后续插件执行
+
                                     return False  # 阻断后续插件执行
                         except Exception as img_e:
                             logger.error(f"解码后数据不是有效图片: {img_e}")
@@ -2377,8 +3335,11 @@ class GeminiImage(PluginBase):
             logger.error(f"处理图片消息失败: {str(e)}")
             logger.error(traceback.format_exc())
 
-        # 如果是在等待融图、反向提示词或图片分析的状态，阻断后续插件执行
-        if user_id in self.waiting_for_merge_images or (user_id in self.waiting_for_reverse_image and self.waiting_for_reverse_image[user_id]) or (user_id in self.waiting_for_analyze_image and self.waiting_for_analyze_image[user_id]):
+        # 如果是在等待融图、反向提示词、图片分析或编辑图片的状态，阻断后续插件执行
+        if user_id in self.waiting_for_merge_images or \
+           (user_id in self.waiting_for_reverse_image and self.waiting_for_reverse_image[user_id]) or \
+           (user_id in self.waiting_for_analyze_image and self.waiting_for_analyze_image[user_id]) or \
+           (user_id in self.waiting_for_edit_image and self.waiting_for_edit_image[user_id]):
             return False  # 阻断后续插件执行
         return True  # 继续执行后续插件
 
@@ -2563,24 +3524,60 @@ class GeminiImage(PluginBase):
             logger.error(f"清理临时文件失败: {str(e)}")
             logger.error(traceback.format_exc())
 
-    def _save_image_to_cache(self, from_wxid: str, sender_wxid: str, image_data: bytes):
+    def _save_image_to_cache(self, from_wxid: str, sender_wxid: str, image_data: bytes = None, file_path: str = None):
         """保存图片到缓存
 
         Args:
             from_wxid: 消息来源ID
             sender_wxid: 发送者ID
-            image_data: 图片数据
+            image_data: 图片数据，可以为None
+            file_path: 图片文件路径，可以为None
         """
         # 使用(from_wxid, sender_wxid)作为键
         cache_key = (from_wxid, sender_wxid)
-        self.image_cache[cache_key] = {
-            "content": image_data,
-            "timestamp": time.time()
-        }
+        conversation_key = f"{from_wxid}_{sender_wxid}"
 
-        logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，键: {cache_key}")
-        logger.info(f"当前图片缓存包含 {len(self.image_cache)} 个条目")
+        # 如果提供了文件路径，保存路径到last_images
+        if file_path and os.path.exists(file_path):
+            self.last_images[conversation_key] = file_path
+            logger.info(f"保存图片路径到缓存: {file_path}, 键: {conversation_key}")
 
+            # 如果需要图片数据，从文件中读取
+            if image_data is None and file_path.endswith(('.jpeg', '.jpg', '.png')):
+                try:
+                    # 直接使用系统缓存的文件，不创建临时副本
+                    if "/app/files/" in file_path:
+                        logger.info(f"直接使用系统缓存的文件: {file_path}")
+                        image_data = None  # 不需要读取图片数据
+                    else:
+                        # 读取图片数据
+                        with open(file_path, "rb") as f_in:
+                            image_data = f_in.read()
+                        logger.info(f"从文件读取图片数据: {file_path}, 大小: {len(image_data)} 字节")
+                except Exception as e:
+                    logger.error(f"读取图片文件失败: {e}")
+
+        # 如果提供了图片数据，保存到image_cache
+        if image_data:
+            self.image_cache[cache_key] = {
+                "content": image_data,
+                "timestamp": time.time()
+            }
+            logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，键: {cache_key}, {from_wxid}_{sender_wxid}")
+            logger.info(f"当前图片缓存包含 {len(self.image_cache)} 个条目")
+
+        # 处理融图功能
+        self._handle_merge_image_upload(from_wxid, sender_wxid, image_data, file_path)
+
+    def _handle_merge_image_upload(self, from_wxid: str, sender_wxid: str, image_data: bytes = None, file_path: str = None):
+        """处理融图图片上传
+
+        Args:
+            from_wxid: 消息来源ID
+            sender_wxid: 发送者ID
+            image_data: 图片数据，可以为None
+            file_path: 图片文件路径，可以为None
+        """
         # 检查所有可能的用户ID，确保能够找到等待融图状态
         possible_user_ids = [sender_wxid, from_wxid]
         for user_id in possible_user_ids:
@@ -2590,15 +3587,29 @@ class GeminiImage(PluginBase):
 
                 # 检查是否已达到最大图片数量
                 if len(image_list) < self.max_merge_images:
-                    # 添加图片到列表
-                    image_list.append(image_data)
-                    logger.info(f"在_save_image_to_cache中添加第 {len(image_list)} 张融图图片，大小: {len(image_data)} 字节，用户ID: {user_id}")
+                    # 如果有文件路径但没有图片数据，从文件中读取
+                    if file_path and not image_data and os.path.exists(file_path):
+                        try:
+                            with open(file_path, "rb") as f:
+                                image_data = f.read()
+                            logger.info(f"从文件读取融图图片数据: {file_path}, 大小: {len(image_data)} 字节")
+                        except Exception as e:
+                            logger.error(f"读取融图图片文件失败: {e}")
+                            continue
 
-                    # 更新等待融合的图片列表
-                    self.waiting_for_merge_images[user_id]["图片列表"] = image_list
+                    # 确保有图片数据
+                    if image_data:
+                        # 添加图片到列表
+                        image_list.append(image_data)
+                        logger.info(f"在_handle_merge_image_upload中添加第 {len(image_list)} 张融图图片，大小: {len(image_data)} 字节，用户ID: {user_id}")
 
-                    # 找到匹配的用户ID后，不再继续检查
-                    break
+                        # 更新等待融合的图片列表
+                        self.waiting_for_merge_images[user_id]["图片列表"] = image_list
+
+                        # 找到匹配的用户ID后，不再继续检查
+                        break
+                    else:
+                        logger.warning(f"没有有效的图片数据用于融图，用户ID: {user_id}")
                 else:
                     logger.info(f"用户 {user_id} 已达到最大融图图片数量 {self.max_merge_images} 张")
             else:
@@ -3427,11 +4438,12 @@ class GeminiImage(PluginBase):
             logger.error(traceback.format_exc())
             return prompt  # 返回原始提示词
 
-    async def _analyze_image(self, image_data: bytes, message_info: dict = None) -> Optional[str]:
+    async def _analyze_image(self, image_data: bytes, user_query: str = "", message_info: dict = None) -> Optional[str]:
         """分析图片内容，返回详细分析结果
 
         Args:
             image_data: 图片数据
+            user_query: 用户指定的分析问题
             message_info: 消息相关信息，包含user_id等
         """
         try:
@@ -3458,9 +4470,14 @@ class GeminiImage(PluginBase):
                 "key": api_key
             }
 
-            # 获取用户的分析问题（如果有）
-            user_query = ""
-            if message_info and "user_id" in message_info:
+            # 记录用户查询
+            if user_query:
+                logger.info(f"_analyze_image 接收到用户查询: '{user_query}'")
+            else:
+                logger.info("_analyze_image 没有接收到用户查询，尝试从waiting_for_analyze_image_query获取")
+
+            # 如果没有直接传入用户查询，尝试从waiting_for_analyze_image_query获取
+            if not user_query and message_info and "user_id" in message_info:
                 user_id = message_info.get("user_id")
                 # 首先尝试直接使用user_id作为键
                 user_query = self.waiting_for_analyze_image_query.get(user_id, "")
@@ -5459,8 +6476,18 @@ class GeminiImage(PluginBase):
         if expired_sessions:
             logger.info(f"清理了 {len(expired_sessions)} 个过期的会话密钥映射")
 
-    def _cleanup_image_cache(self):
-        """清理过期的图片缓存"""
+    def _cleanup_image_cache(self, force_clear=False):
+        """清理过期的图片缓存
+
+        Args:
+            force_clear: 是否强制清空所有图片缓存
+        """
+        if force_clear:
+            # 强制清空所有图片缓存
+            self.image_cache.clear()
+            logger.info(f"已强制清空所有图片缓存")
+            return
+
         current_time = time.time()
         expired_keys = []
 
@@ -5476,70 +6503,107 @@ class GeminiImage(PluginBase):
         if expired_keys:
             logger.info(f"清理后图片缓存包含 {len(self.image_cache)} 个条目")
 
-    def _save_image_to_cache(self, chat_id: str, user_id: str, image_data: bytes):
+    def _save_image_to_cache(self, chat_id: str, user_id: str, image_data: bytes, file_path: str = None):
         """保存图片数据到缓存
 
         Args:
             chat_id: 聊天ID
             user_id: 用户ID
             image_data: 图片数据
+            file_path: 图片文件路径，如果提供则优先使用
         """
-        if not image_data:
-            logger.warning("尝试保存空图片数据到缓存")
+        # 构建会话标识
+        conversation_key = f"{chat_id}_{user_id}"
+
+        # 如果提供了文件路径，直接使用
+        if file_path and os.path.exists(file_path):
+            self.last_images[conversation_key] = file_path
+            logger.info(f"直接使用系统缓存的图片路径: {file_path}")
             return
 
-        # 使用多种格式的键保存图片，以确保后续能找到
-        # 1. 元组键 (chat_id, user_id)
-        tuple_key = (chat_id, user_id)
-        self.image_cache[tuple_key] = {
-            "content": image_data,
-            "timestamp": time.time()
-        }
+        # 如果没有提供文件路径但有图片数据，保存到本地
+        if image_data:
+            # 保存到最后一次生成的图片路径
+            image_path = os.path.join(self.save_dir, f"cache_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
+            try:
+                with open(image_path, "wb") as f:
+                    f.write(image_data)
+                self.last_images[conversation_key] = image_path
+                logger.info(f"保存图片到文件: {image_path}")
+            except Exception as e:
+                logger.error(f"保存图片到文件失败: {e}")
+        else:
+            logger.warning("尝试保存空图片数据到缓存")
 
-        # 2. 字符串键 "chat_id_user_id"
-        str_key = f"{chat_id}_{user_id}"
-        self.image_cache[str_key] = {
-            "content": image_data,
-            "timestamp": time.time()
-        }
+        # 更新会话时间戳
+        self.conversation_timestamps[conversation_key] = time.time()
 
-        # 3. 如果是私聊，也使用单独的chat_id作为键
-        if chat_id == user_id:
-            self.image_cache[chat_id] = {
-                "content": image_data,
-                "timestamp": time.time()
-            }
+    async def _get_recent_image(self, chat_id: str, user_id: str) -> tuple:
+        """获取最近的图片数据，区分群聊中的不同用户
 
-        # 4. 保存到最后一次生成的图片路径
-        conversation_key = f"{chat_id}_{user_id}"
-        image_path = os.path.join(self.save_dir, f"cache_{int(time.time())}_{uuid.uuid4().hex[:8]}.png")
-        try:
-            with open(image_path, "wb") as f:
-                f.write(image_data)
-            self.last_images[conversation_key] = image_path
-            logger.info(f"保存图片到文件: {image_path}")
-        except Exception as e:
-            logger.error(f"保存图片到文件失败: {e}")
-
-        logger.info(f"成功缓存图片数据，大小: {len(image_data)} 字节，键: {tuple_key}, {str_key}")
-        logger.info(f"当前图片缓存包含 {len(self.image_cache)} 个条目")
-
-    async def _get_recent_image(self, chat_id: str, user_id: str) -> Optional[bytes]:
-        """获取最近的图片数据，区分群聊中的不同用户"""
+        Returns:
+            tuple: (image_path, image_data) 图片路径和图片数据的元组
+                   如果只有路径，则返回 (image_path, None)
+                   如果只有数据，则返回 (None, image_data)
+                   如果都没有，则返回 (None, None)
+        """
         logger.info(f"尝试获取图片缓存，chat_id: {chat_id}, user_id: {user_id}")
 
-        # 记录当前缓存状态
-        logger.info(f"当前图片缓存包含 {len(self.image_cache)} 个条目")
-        for key in self.image_cache.keys():
-            logger.info(f"缓存键: {key}, 类型: {type(key)}")
+        # 构建会话标识
+        conversation_key = f"{chat_id}_{user_id}"
 
-        # 先尝试从用户专属缓存获取 - 使用元组键
+        # 记录当前缓存状态
+        logger.info(f"当前插件图片缓存包含 {len(self.image_cache)} 个条目")
+
+        # 1. 优先检查所有可能的系统缓存图片路径
+
+        # 1.1 检查conversation_key对应的图片路径
+        last_image_path = self.last_images.get(conversation_key)
+        if last_image_path and os.path.exists(last_image_path):
+            if "/app/files/" in last_image_path:
+                logger.info(f"找到系统缓存的图片路径(conversation_key): {last_image_path}")
+                return (last_image_path, None)  # 返回路径，不返回数据
+
+        # 1.2 检查所有包含chat_id或user_id的键对应的图片路径
+        for key, value in self.last_images.items():
+            if (chat_id in key or user_id in key) and os.path.exists(value):
+                if "/app/files/" in value:
+                    logger.info(f"找到系统缓存的图片路径(key): {value}")
+                    return (value, None)  # 返回路径，不返回数据
+
+        # 1.3 尝试在/app/files/目录下查找最近的图片
+        try:
+            app_files_dir = "/app/files/"
+            if os.path.exists(app_files_dir):
+                # 获取目录中的所有文件
+                files = os.listdir(app_files_dir)
+                # 按修改时间排序，最新的在前面
+                files.sort(key=lambda x: os.path.getmtime(os.path.join(app_files_dir, x)), reverse=True)
+                # 考虑jpeg和png文件
+                image_files = [f for f in files if f.endswith(('.jpeg', '.png', '.jpg'))]
+
+                if image_files:
+                    # 获取最新的图片文件
+                    latest_file = os.path.join(app_files_dir, image_files[0])
+                    logger.info(f"找到最新的系统缓存图片: {latest_file}")
+
+                    # 保存图片路径到最后一次生成的图片路径
+                    self.last_images[conversation_key] = latest_file
+
+                    # 直接返回图片路径，不读取图片数据
+                    return (latest_file, None)  # 返回路径，不返回数据
+        except Exception as e:
+            logger.error(f"尝试获取系统缓存的最新图片失败: {e}")
+
+        # 2. 如果没有找到系统缓存的图片路径，尝试从图片数据缓存中获取
+
+        # 2.1 尝试从用户专属缓存获取 - 使用元组键
         cache_key = (chat_id, user_id)
         if cache_key in self.image_cache:
             cache_data = self.image_cache[cache_key]
             if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                 logger.info(f"找到用户 {user_id} 在聊天 {chat_id} 中的图片缓存，使用元组键")
-                return cache_data["content"]
+                return (None, cache_data["content"])  # 返回数据，不返回路径
 
         # 尝试使用字符串格式的键 "chat_id_user_id"
         str_cache_key = f"{chat_id}_{user_id}"
@@ -5547,7 +6611,7 @@ class GeminiImage(PluginBase):
             cache_data = self.image_cache[str_cache_key]
             if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                 logger.info(f"找到用户 {user_id} 在聊天 {chat_id} 中的图片缓存，使用字符串键")
-                return cache_data["content"]
+                return (None, cache_data["content"])  # 返回数据，不返回路径
 
         # 如果是私聊且没找到，尝试使用旧格式的键
         if chat_id == user_id:
@@ -5556,14 +6620,14 @@ class GeminiImage(PluginBase):
                 cache_data = self.image_cache[chat_id]
                 if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                     logger.info(f"找到旧格式的图片缓存，键: {chat_id}")
-                    return cache_data["content"]
+                    return (None, cache_data["content"])  # 返回数据，不返回路径
 
             # 尝试使用user_id作为键
             if user_id in self.image_cache:
                 cache_data = self.image_cache[user_id]
                 if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                     logger.info(f"找到旧格式的图片缓存，键: {user_id}")
-                    return cache_data["content"]
+                    return (None, cache_data["content"])  # 返回数据，不返回路径
 
         # 尝试查找任何包含chat_id或user_id的键
         for key in list(self.image_cache.keys()):
@@ -5573,29 +6637,28 @@ class GeminiImage(PluginBase):
                     cache_data = self.image_cache[key]
                     if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                         logger.info(f"找到相关的图片缓存，键: {key}")
-                        return cache_data["content"]
+                        return (None, cache_data["content"])  # 返回数据，不返回路径
             elif isinstance(key, str):
                 # 检查字符串键中是否包含chat_id或user_id
                 if chat_id in key or user_id in key:
                     cache_data = self.image_cache[key]
                     if time.time() - cache_data["timestamp"] <= self.image_cache_timeout:
                         logger.info(f"找到相关的图片缓存，键: {key}")
-                        return cache_data["content"]
+                        return (None, cache_data["content"])  # 返回数据，不返回路径
 
-        # 如果所有尝试都失败，检查最后一次生成的图片
-        conversation_key = f"{chat_id}_{user_id}"
+        # 3. 如果所有尝试都失败，检查最后一次生成的图片（非系统缓存）
         last_image_path = self.last_images.get(conversation_key)
         if last_image_path and os.path.exists(last_image_path):
             try:
-                with open(last_image_path, "rb") as f:
-                    image_data = f.read()
-                logger.info(f"从最后生成的图片路径获取图片数据: {last_image_path}")
-                return image_data
+                # 普通图片路径（非系统缓存）
+                if "/app/files/" not in last_image_path:
+                    logger.info(f"找到普通图片路径: {last_image_path}")
+                    return (last_image_path, None)  # 返回路径，不返回数据
             except Exception as e:
-                logger.error(f"读取最后生成的图片失败: {e}")
+                logger.error(f"处理图片路径失败: {e}")
 
         logger.warning(f"未找到任何可用的图片缓存，chat_id: {chat_id}, user_id: {user_id}")
-        return None
+        return (None, None)  # 都没有找到，返回(None, None)
 
     async def _handle_analyze_image(self, bot: WechatAPIClient, message: dict, image_data: bytes):
         """处理图片分析请求
@@ -5630,8 +6693,12 @@ class GeminiImage(PluginBase):
                 "sender_wxid": sender_wxid
             }
 
+            # 获取用户的分析问题（如果有）
+            user_query = self.waiting_for_analyze_image_query.get(sender_wxid, "")
+            logger.info(f"_handle_analyze_image 调用分析API，用户查询: '{user_query}'")
+
             # 调用图片分析
-            result = await self._analyze_image(image_data, message_info)
+            result = await self._analyze_image(image_data, user_query, message_info)
 
             if result:
                 # 发送结果
@@ -5702,3 +6769,4 @@ class GeminiImage(PluginBase):
             else:
                 await bot.send_text_message(chat_id, f"分析图片失败: {str(e)}")
                 logger.info(f"使用chat_id发送图片分析异常消息")
+
